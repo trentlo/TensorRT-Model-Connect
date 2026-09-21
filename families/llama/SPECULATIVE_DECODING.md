@@ -16,6 +16,9 @@ adds standalone plugins behind build flags. Its explicit v2 state ABI and
 runtime alias qualification are documented separately; the v1 native graph
 path below remains the default.
 
+[Repeated GB100 performance measurements](SPECULATIVE_PERFORMANCE.md) compare
+native MC, plugin MC and Edge-LLM separately from the correctness runs below.
+
 ## Ownership and entry points
 
 - `speculative/contract.py`: versioned compiler/runtime tensor and state ABI.

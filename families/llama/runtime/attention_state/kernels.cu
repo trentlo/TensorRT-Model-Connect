@@ -123,6 +123,15 @@ cudaError_t attention(const void* query, const void* keys, const void* values, c
                       int batch, int heads, int kv_heads, int queries, int key_count,
                       int value_count, int page_size, int logical_pages, int dim, int mask_heads,
                       cudaStream_t stream) {
+#ifdef TRTMC_LLAMA_EDGE_XQA
+    const auto addresses =
+        reinterpret_cast<std::uintptr_t>(query) | reinterpret_cast<std::uintptr_t>(keys) |
+        reinterpret_cast<std::uintptr_t>(values) | reinterpret_cast<std::uintptr_t>(output);
+    if (dim == 128 && page_size == 64 && queries <= 64 && addresses % 16 == 0)
+        return xqa_attention(query, keys, values, key_pages, value_pages, lengths, mask, output,
+                             batch, heads, kv_heads, queries, key_count, value_count, logical_pages,
+                             mask_heads, stream);
+#endif
     paged_attention<<<batch * heads * queries, 256, logical_pages * page_size * sizeof(float),
                       stream>>>(static_cast<const half*>(query), static_cast<const half*>(keys),
                                 static_cast<const half*>(values), key_pages, value_pages, lengths,

@@ -1,5 +1,9 @@
 # Llama 3.1 / EAGLE3 performance measurement
 
+This records the original scalar-plugin baseline. See the subsequent
+[standalone XQA port and fresh comparison](SPECULATIVE_XQA_PERFORMANCE.md)
+for the optimized plugin and profiling evidence.
+
 Measured September 21, 2026 on one Blackwell GB100 (SM100), using the existing
 FP16 Llama-3.1-8B-Instruct / EAGLE3 bundles. These are complete synchronous
 request measurements of the current prototypes, including runtime scheduling

@@ -6,10 +6,11 @@ plugins. It does not modify the installed TensorRT Python/C++ API. The default
 `primitives` backend and existing v1 bundles retain native linear KV updates
 and explicit graph attention.
 
-The library contains original, correctness-oriented CUDA implementations;
-no Edge-LLM code or package is needed to build or run it. Edge-LLM remains an
-independent validation reference. No performance or production paging claim
-is made. The initial model profile remains FP16, batch one, one GPU, greedy
+The library contains MC's indexed-write kernel, an extracted Edge-LLM XQA
+attention kernel, and the original scalar attention fallback. The imported
+source is vendored: no Edge-LLM checkout, package, runner or plugin is needed
+to build or run MC. Edge-LLM also remains an independent validation reference.
+This is not a production paging allocator. The initial model profile remains FP16, batch one, one GPU, greedy
 Llama3.1/EAGLE3. The kernel supports padded batches, GQA, boolean masks,
 head dimensions up to 256 and logical capacity up to 4096. Packed queries,
 quantized KV, additive masks and built-in causal/window modes are not qualified.
@@ -39,6 +40,19 @@ plugin bundle with an explicit error. The default build does not link the
 plugin library. Ordinary model operations, including projections, norms,
 RoPE, MLPs, feature concatenation, logits and mask composition, remain graph ops.
 
+With plugins enabled, `TRTMC_LLAMA_EDGE_XQA=ON` (the default) compiles the
+extracted XQA kernel for FP16, head dimension 128, page size 64 and at most 64
+query rows. Its aligned tensor-core path covers chunked prefill, ordinary
+decode, chain and tree verification. Other geometries or unaligned buffers
+use the scalar implementation. Set `TRTMC_LLAMA_EDGE_XQA=OFF` to build the
+original scalar plugin. The `primitives` backend is unchanged.
+
+Only attention was extracted: profiling showed that indexed writes were less
+than 1% of baseline GPU kernel time. See the [source provenance and adaptation
+notes](runtime/attention_state/edge_xqa/README.md). The plugin creator/version,
+serialized fields, tensor bindings, required workspace and state ABI remain
+unchanged; existing v2 plugin bundles can use the new library.
+
 ## API and effects
 
 `AttentionStateGraph.add_kv_cache_update(cache, update, write_indices,
@@ -59,12 +73,22 @@ Configuration precedes `get_output(0)`, which materializes the V3 node.
 
 Paged lookup for logical key `j` is
 `pool[table[b,j//P],h,j%P,d]`. K/V table entries are physical page IDs;
-mask columns and positions are logical. Length bounds lookup before any table
-or KV load. Unused page-table entries may be `-1`. The plugin skips invisible
-rows entirely and returns zero for an empty attention row. This avoids stale
-NaNs in masked storage. Query/key dot products accumulate in FP32; exposed
-scores and probabilities round to FP16, and the result is FP16, matching the
-primitive graph's tensor precisions without promising bitwise logit equality.
+mask columns and positions are logical. Length bounds logical participation
+and the pages that may be resolved. A tiled kernel may read allocated tail
+slots within the last mapped page, but those slots must not affect the result.
+Unused page-table entries may be `-1`. Invisible rows must not
+affect the result, even when they contain stale NaNs; empty attention rows
+return zero. The scalar path skips those rows. XQA uses tiled loads and a
+scalar repair for non-finite outputs, preserving that observable behavior
+without requiring runtime cache clearing.
+
+Query/key products accumulate in FP32 and scores round to FP16. XQA uses
+online softmax with FP16 unnormalized weights and FP32 accumulation; the
+scalar/primitive paths round normalized probabilities to FP16. Final outputs
+are FP16. The contract requires numerical agreement within the established
+attention tolerance, not identical internal softmax rounding or bitwise
+logits. Cache bytes, page lookup, visibility, lengths and aliasing remain
+exact requirements. Any future OOTB lowering must satisfy those same checks.
 
 ```mermaid
 flowchart LR

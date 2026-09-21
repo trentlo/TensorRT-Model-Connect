@@ -33,7 +33,8 @@ def reference(query, keys, values, kp, vp, lengths, mask, slots_k, slots_v, new_
     output = np.zeros_like(query)
     for b, h, q in np.ndindex(query.shape[:3]):
         kh = h // (query.shape[1] // keys.shape[1])
-        visible = np.flatnonzero(mask[b, 0, q, :lengths[b]])
+        mh = 0 if mask.shape[1] == 1 else h
+        visible = np.flatnonzero(mask[b, mh, q, :lengths[b]])
         if not len(visible):
             continue
         k = np.stack([keys[kp[b, j // page_size], kh, j % page_size] for j in visible])
@@ -45,7 +46,69 @@ def reference(query, keys, values, kp, vp, lengths, mask, slots_k, slots_v, new_
     return keys, values, output
 
 
-def run(path):
+def xqa_arrays(case, random, rng):
+    """Exercise the demanded XQA geometry with independent pool maps and full masks."""
+    queries = {"decode": 1, "chain": 5, "tree": 9, "prefill": 64,
+               "masked_nan": 9, "tail_nan": 9, "short_history": 64,
+               "empty_history": 5}[case]
+    batch, heads, kv_heads, pages, page_size, dim = 2, 8, 2, 5, 64, 128
+    capacity = pages * page_size
+    lengths = np.array([141, 129], np.int32)
+    kp = np.array([[2, 0, 3, -1, -1], [0, 3, 2, -1, -1]], np.int32)
+    vp = np.array([[1, 3, 0, -1, -1], [3, 0, 1, -1, -1]], np.int32)
+    if case == "tail_nan":
+        batch = 1
+        lengths, kp, vp = lengths[:1], kp[:1], vp[:1]
+    arrays = {
+        "q": random((batch, heads, queries, dim)),
+        "k": random((pages, kv_heads, page_size, dim)),
+        "v": random((pages, kv_heads, page_size, dim)),
+        "new_k": random((batch, kv_heads, queries, dim)),
+        "new_v": random((batch, kv_heads, queries, dim)),
+        "ks": np.full((batch, queries), -1, np.int32),
+        "vs": np.full((batch, queries), -1, np.int32),
+        "kp": kp, "vp": vp, "length": lengths,
+        "mask": np.zeros((batch, heads, queries, capacity), np.bool_),
+    }
+    # Shared physical pools are read-only here; the original small fixture
+    # separately verifies writes, aliases and overlapping page boundaries.
+    for b in range(batch):
+        prefix = int(lengths[b]) - queries
+        for q in range(queries):
+            arrays["mask"][b, :, q, :prefix] = True
+            if case in ("tree", "masked_nan"):
+                row = q
+                while row >= 0:
+                    arrays["mask"][b, :, q, prefix + row] = True
+                    row = [-1, 0, 0, 1, 1, 3, 3, 5, 5][row]
+            else:
+                arrays["mask"][b, :, q, prefix:prefix + q + 1] = True
+        # Prefix holes and head-specific visibility must not be mistaken for
+        # Edge's implicit all-visible prefix plus packed candidate-only mask.
+        arrays["mask"][b, 1::2, :, 3:17] = False
+    arrays["mask"][:, -1, -1] = False
+    arrays["k"][4] = np.nan
+    arrays["v"][4] = np.nan
+    if case == "masked_nan":
+        # Poison a mapped row, hidden from every query that could read it.
+        for b in range(batch):
+            arrays["k"][kp[b, 0], :, 7] = np.nan
+            arrays["v"][vp[b, 0], :, 7] = np.nan
+        arrays["mask"][:, :, :, 7::page_size] = False
+    if case == "empty_history":
+        arrays["length"][:] = 0
+        arrays["k"][:] = np.nan
+        arrays["v"][:] = np.nan
+    if case == "tail_nan":
+        for j in range(int(lengths[0]), 3 * page_size):
+            arrays["k"][kp[0, j // page_size], :, j % page_size] = np.nan
+            arrays["v"][vp[0, j // page_size], :, j % page_size] = np.nan
+    if case == "short_history":
+        arrays["length"][:] = 1
+    return arrays
+
+
+def run(path, case="small"):
     library = load_plugins(path)
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
@@ -74,6 +137,8 @@ def run(path):
     arrays["k"][4] = np.nan
     arrays["v"][4] = np.nan
     arrays["mask"][:, :, -1, :] = False  # Defined empty-row behavior.
+    if case != "small":
+        arrays = xqa_arrays(case, random, rng)
     types = {np.dtype("float16"): trt.float16, np.dtype("int32"): trt.int32, np.dtype("bool"): trt.bool}
     tensors = {name: network.add_input(name, types[value.dtype], value.shape)
                for name, value in arrays.items()}
@@ -129,7 +194,10 @@ def run(path):
         np.testing.assert_array_equal(actual[0].view(np.uint16), expected[0].view(np.uint16))
         np.testing.assert_array_equal(actual[1].view(np.uint16), expected[1].view(np.uint16))
         np.testing.assert_allclose(actual[2], expected[2], rtol=0.005, atol=0.0005)
-        assert np.all(actual[2][:, :, -1] == 0)
+        empty = ~arrays["mask"].any(axis=-1)
+        if empty.shape[1] == 1:
+            empty = np.repeat(empty, arrays["q"].shape[1], axis=1)
+        assert np.all(actual[2][empty] == 0)
         aliases = {name: engine.get_aliased_input_tensor(name) for name in ("present_k", "present_v")}
         # A private compiler allocation must not be accepted as persistent state.
         # Removing ownership is a deterministic way to exercise that guard.
@@ -137,11 +205,15 @@ def run(path):
         registered.remove(pointers["k"])
         assert not context.execute_async_v3(stream), "unregistered state was accepted"
         checked(cuda.cudaStreamSynchronize(stream))
-        print(json.dumps({"passed": True, "engine_aliases": aliases,
+        checks = ["untouched_bytes", "independent_kv_maps", "gqa", "mask", "length", "empty_row",
+                  "stale_nan", "unregistered_state_rejected", "old_state_reader_rejected"]
+        if case == "small":
+            checks += ["indexed_write", "skip", "cross_page"]
+        else:
+            checks += ["xqa_geometry", "per_head_mask", "prefix_holes"]
+        print(json.dumps({"passed": True, "case": case, "engine_aliases": aliases,
                           "max_attention_error": float(np.max(np.abs(actual[2] - expected[2]))),
-                          "cases": ["indexed_write", "skip", "untouched_bytes", "cross_page",
-                                    "independent_kv_maps", "gqa", "mask", "length", "empty_row", "stale_nan",
-                                    "unregistered_state_rejected", "old_state_reader_rejected"]}))
+                          "cases": checks}))
     finally:
         checked(cuda.cudaStreamSynchronize(stream))
         for pointer in registered:
@@ -152,4 +224,6 @@ def run(path):
 
 
 if __name__ == "__main__":
-    run(sys.argv[1])
+    for case in ("small", "decode", "chain", "tree", "prefill", "masked_nan", "tail_nan",
+                 "short_history", "empty_history"):
+        run(sys.argv[1], case)

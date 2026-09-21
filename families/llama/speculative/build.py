@@ -63,11 +63,24 @@ def load_draft(path: Path, embedding: np.ndarray):
 
 def build_speculative(*, model_dir: Path, draft_dir: Path, output: Path,
                       max_sequence_length: int = 2048, max_query: int = 64,
-                      draft_depth: int = 4, spec_dec: str = "eagle3", verbose: bool = False) -> int:
+                      draft_depth: int = 4, spec_dec: str = "eagle3", verbose: bool = False,
+                      attention_backend: str = "primitives", kv_page_size: int = 64,
+                      attention_plugin_library: Path | None = None) -> int:
     from .graph import build_draft, build_target
 
     if spec_dec != "eagle3":
         raise ValueError("only EAGLE3 is implemented in this prototype")
+    state = {}
+    if attention_backend == "plugin":
+        from .attention_state import load_plugins
+        if attention_plugin_library is None:
+            raise ValueError("--attention-plugin-library is required for the plugin backend")
+        load_plugins(attention_plugin_library)
+        state = dict(version=2, attention_backend="plugin", page_size=kv_page_size,
+                     cache_layout="pages_heads_slots_dim", cache_update="aliased_indexed_write",
+                     alias_contract="plugin_local_alias_runtime_identity_guard")
+    elif attention_backend != "primitives":
+        raise ValueError("attention backend must be primitives or plugin")
     config = ModelConfig.from_dir(model_dir)
     if (config.model_type != "llama" or config.hidden_size != 4096
             or config.num_hidden_layers != 32 or config.vocab_size != 128256
@@ -80,6 +93,7 @@ def build_speculative(*, model_dir: Path, draft_dir: Path, output: Path,
     target_contract = EngineContract(
         "target", config.num_hidden_layers, config.hidden_size, config.num_key_value_heads,
         config.head_dim, config.vocab_size, max_sequence_length, max_query, 3 * config.hidden_size,
+        **state,
     )
     weights = load_standard_weights(model_dir, config, precision="fp16")
     draft_config, draft_weights, mapping = load_draft(draft_dir, weights["embedding"])
@@ -89,6 +103,7 @@ def build_speculative(*, model_dir: Path, draft_dir: Path, output: Path,
         "draft", draft_config.num_hidden_layers, draft_config.hidden_size,
         draft_config.num_key_value_heads, draft_config.head_dim, len(mapping),
         max_sequence_length, max_query, 3 * config.hidden_size,
+        **state,
     )
     writer = BundleWriter(output)
     runtime_metadata = _runtime_config(model_dir, config)
@@ -99,7 +114,7 @@ def build_speculative(*, model_dir: Path, draft_dir: Path, output: Path,
             "target": target_contract.to_dict(), "draft": draft_contract.to_dict(),
             "target_feature_indices": [2, 16, 28], "d2t": mapping.tolist(),
             "stop_token_ids": runtime_metadata.get("eos_token_ids", [runtime_metadata["eos_token_id"]]),
-            "attention_lowering": "tensorrt_primitives",
+            "attention_lowering": "standalone_plugins" if state else "tensorrt_primitives",
             "target_config": config.raw, "draft_config": draft_config.raw,
         })
         print("Compiling speculative target...", flush=True)

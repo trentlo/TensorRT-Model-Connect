@@ -11,6 +11,11 @@ The first implementation uses TensorRT-native graph primitives, including
 kernel has been ported yet: execution and correctness do not require one.
 This is a correctness and architecture prototype, not a performance claim.
 
+The optional [indexed KV/paged attention backend](ATTENTION_STATE_PLUGINS.md)
+adds standalone plugins behind build flags. Its explicit v2 state ABI and
+runtime alias qualification are documented separately; the v1 native graph
+path below remains the default.
+
 ## Ownership and entry points
 
 - `speculative/contract.py`: versioned compiler/runtime tensor and state ABI.
@@ -118,9 +123,9 @@ despite the one-token offset in their conditioning semantics.
 
 ## Swapping attention implementations
 
-`Graph.attention()` currently forms Q/K/V, applies RoPE, performs native linear
-KV updates, and emits an explicit masked attention graph. A future plugin
-lowering can replace this region without changing the external ABI if it:
+The default `Graph.attention()` path forms Q/K/V, applies RoPE, performs native
+linear KV updates, and emits explicit masked attention. An implementation
+replacing this v1 region without changing its external ABI must:
 
 1. Preserves the same FP16 Q/K/V, scale `1/sqrt(D)`, rotate-half RoPE and
    grouped-query semantics.
@@ -144,12 +149,88 @@ adapter. In particular, current Edge-LLM's paged, packed-mask ABI is **not**
 binary compatible with this linear layout. A donor kernel must be adapted at
 this seam; its runtime memory assumptions cannot be copied silently.
 
-The initial extension point is source-level graph selection. No unused plugin
-loader, kernel copy, or speculative-technique registry is introduced. A future
-plugin port should include only the required kernel and its dependency closure,
-retain its license/provenance, and run the same contract tests against both
-lowerings. Plugin performance and native fused-attention coverage remain
-separate qualification work.
+The extension point is source-level graph selection. The optional standalone
+plugin backend implements indexed writes and paged reads through a separately
+versioned [v2 state contract](ATTENTION_STATE_PLUGINS.md). It uses original
+kernels and does not import Edge-LLM. Any later donor-kernel port should include
+only the required dependency closure, retain its license/provenance, and run
+the same contract tests. Plugin performance and native fused-attention coverage
+remain separate qualification work.
+
+## Design refinement: reusable state and model I/O
+
+This September 21 refinement does not change the implemented version-1 ABI.
+
+The compiler/runtime contract has three parts: model input/output semantics,
+state representation and effects, and execution constraints. KV management is
+the main externally mutable model-state mechanism for this dense Llama pair.
+EAGLE3 also passes residual features between calls as ordinary tensor values;
+those features are not hidden side effects or additional KV state. Hybrid
+models may require recurrent and convolution state in addition to KV.
+
+Speculative method, state representation, and attention implementation should
+be independently selectable within qualified combinations:
+
+- The method constructs candidate histories and selects the continuation.
+- A state manager reserves/binds storage and retains or discards evaluated
+  rows without interpreting the speculative method name.
+- Each engine declares a concrete physical state ABI and its permitted
+  reads, writes, aliases, initialization rules, and ordering requirements.
+- Model-specific conditioning and draft refresh remain method/family logic.
+  EAGLE3 feedback requires verified target features, not just KV compaction.
+
+The current engine adapter and EAGLE3 policy provide an initial separation;
+there is no general state-manager interface or paged implementation yet.
+Iterative token-by-token drafting is not a universal requirement: block
+drafters can propose multiple tokens per call. Target verification requires
+the correct per-row history; a chain can use causal visibility, while a tree
+needs ancestor visibility. Its encoding is an explicit engine ABI choice.
+
+### Semantic state obligations and physical ABI
+
+Reuse semantic obligations across cache implementations: evaluate the declared
+history, isolate tentative writes, preserve published state, and make only
+the retained continuation visible. A concrete engine still binds one exact
+representation. Linear append indices, paged read/write mappings, cache dtype
+and geometry, quantization metadata, and aliases cannot change silently.
+Other state kinds may use fresh state outputs rather than this ABI's in-place
+aliases; they need their own declared effects.
+
+A future paged profile must specify page size and pool layout, mapping tensor
+encoding, query-row write slots, valid rows in partial pages, and shared-page
+ownership. Shared tails require copy-on-write or separate tentative storage.
+Page remapping can retain a selected path only when token placement permits
+it; arbitrary accepted rows inside a page can still require copies. Mapping
+updates and reclamation must wait for in-flight consumers. Allocation,
+reference counting, path retention, and discard are runtime operations, not
+mandatory new compiler entry points. If a state utility is compiled, its
+inputs/outputs and effects use the ordinary engine contract.
+
+### Target/draft composition and position semantics
+
+Exported feature semantics are part of the compiler/runtime I/O contract:
+producer and exact tap, normalization point, concatenation order, dtype,
+row/token association, and lifetime. Connecting those tensors to another
+model and deciding when to execute it are runtime composition.
+
+For this EAGLE3 pair, verified target feature `F_i` is paired with token
+`x_(i+1)` at draft position `i`. The recurrent proposal path uses the previous
+draft residual instead. Keep logical positions, materialized progress, and
+physical storage slots separate; page IDs or flattened candidate indices do
+not determine RoPE positions. A target-only prefix-cache hit also needs an
+explicit path to restore or rebuild compatible draft/feature state.
+
+Paging and speculation are not the complete requirement set. Extension
+profiles must account for ragged batching, chunked prefill, prefix sharing,
+sliding windows, quantized-cache metadata, state/checkpoint identity, and
+eventually distributed/offloaded or hybrid state. These are declared
+capabilities, not required additional bindings on the initial linear engine.
+
+The pinned donor illustrates block drafting in
+`cpp/runtime/decoding/dflashDecodeUtils.cpp`, paged bindings in
+`cpp/common/bindingNames.h`, and hybrid state finalization in
+`cpp/runtime/decoding/mtpDecoder.cpp`. Those files remain reference material;
+they are not Model-Connect build dependencies.
 
 ## Validation
 
@@ -207,7 +288,7 @@ autoregressive and EAGLE3. It also checks prompt counts and Model-Connect
 request-reset equivalence. The GPU test and reference test report IDs rather
 than relying on detokenized text equality.
 
-### Recorded prototype result
+### Recorded initial native result (September 18)
 
 Validated on a Blackwell GB100 (SM100), TensorRT 11.1.0.106, CUDA 13.3 and
 driver 595.58.03, using FP16 engines and KV state. The target checkpoint was
@@ -238,5 +319,7 @@ tensorwise-logit or general model-quality qualification. In particular, this
 Edge revision's `collectRopeConfig` maps `llama3` scaling to default RoPE;
 Model-Connect retains the checkpoint's scaled RoPE. Broader prompt and
 long-context numerical qualification must account for that reference
-difference. Full beam-policy parity, sampled decoding, batching, paged KV,
-quantization, plugin lowering and fused native attention remain follow-up work.
+difference. Indexed paged KV and plugin lowering were subsequently validated
+on September 21; see [the plugin contract and results](ATTENTION_STATE_PLUGINS.md).
+Full beam-policy parity, sampled decoding, batching, dynamic page allocation,
+quantization and fused native paged attention remain follow-up work.

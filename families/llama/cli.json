@@ -13,6 +13,9 @@
       {"name": "max_sequence_length", "flags": ["--max-sequence-length"], "type": "int", "default": 2048},
       {"name": "max_query", "flags": ["--max-query"], "type": "int", "default": 64},
       {"name": "draft_depth", "flags": ["--draft-depth"], "type": "int", "default": 4},
+      {"name": "attention_backend", "flags": ["--attention-backend"], "type": "string", "default": "primitives", "choices": ["primitives", "plugin"]},
+      {"name": "kv_page_size", "flags": ["--kv-page-size"], "type": "int", "default": 64},
+      {"name": "attention_plugin_library", "flags": ["--attention-plugin-library"], "type": "path"},
       {"name": "verbose", "flags": ["--verbose"], "type": "bool", "action": "store_true", "default": false}
     ]
   }]

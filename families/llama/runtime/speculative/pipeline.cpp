@@ -7,6 +7,9 @@
 #include "families/llama/runtime/chat_templates.h"
 #include "families/llama/runtime/plugin_helpers.h"
 #include "families/llama/runtime/speculative/eagle3.h"
+#ifdef TRTMC_LLAMA_ATTENTION_STATE_PLUGINS
+#include "families/llama/runtime/attention_state/plugin_api.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -42,6 +45,14 @@ Pipeline::Pipeline(const FamilyContext& context) {
         throw std::invalid_argument("unsupported speculative bundle version or method");
     auto target = Contract::parse(manifest_.at("target"));
     auto draft = Contract::parse(manifest_.at("draft"));
+    if (target.page_size || draft.page_size) {
+#ifdef TRTMC_LLAMA_ATTENTION_STATE_PLUGINS
+        if (!trtmcAttentionStateInit())
+            throw std::runtime_error("could not register attention-state plugins");
+#else
+        throw std::runtime_error("bundle requires TRTMC_LLAMA_ATTENTION_STATE_PLUGINS=ON");
+#endif
+    }
     if (target.draft || !draft.draft || target.capacity != draft.capacity ||
         target.feature_width != draft.feature_width || target.hidden != draft.hidden)
         throw std::invalid_argument("incompatible target/draft contracts");

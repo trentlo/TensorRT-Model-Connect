@@ -3,6 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "families/llama/runtime/speculative/engine.h"
+#ifdef TRTMC_LLAMA_ATTENTION_STATE_PLUGINS
+#include "families/llama/runtime/attention_state/plugin_api.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -22,9 +25,18 @@ void require(bool condition, const std::string& message) {
 } // namespace
 
 Contract Contract::parse(const nlohmann::json& value) {
-    require(value.at("version") == 1 && value.at("precision") == "fp16" &&
-                value.at("cache_layout") == "batch_heads_capacity_dim" &&
-                value.at("cache_update") == "aliased_contiguous_append",
+    const bool linear =
+        value.at("version") == 1 && value.at("cache_layout") == "batch_heads_capacity_dim" &&
+        value.at("cache_update") == "aliased_contiguous_append" &&
+        value.value("attention_backend", "primitives") == "primitives" &&
+        value.value("alias_contract", "engine_required_alias") == "engine_required_alias" &&
+        value.value("page_size", 0) == 0;
+    const bool paged = value.at("version") == 2 &&
+                       value.at("cache_layout") == "pages_heads_slots_dim" &&
+                       value.at("cache_update") == "aliased_indexed_write" &&
+                       value.at("attention_backend") == "plugin" &&
+                       value.at("alias_contract") == "plugin_local_alias_runtime_identity_guard";
+    require((linear || paged) && value.at("precision") == "fp16",
             "unsupported version, precision or state layout");
     const auto role = value.at("role").get<std::string>();
     require(role == "target" || role == "draft", "invalid engine role");
@@ -35,15 +47,22 @@ Contract Contract::parse(const nlohmann::json& value) {
                 c.capacity > 0 && c.max_query > 0 && c.max_query <= c.capacity &&
                 c.feature_width > 0,
             "invalid dimensions");
+    if (paged) {
+        c.page_size = value.at("page_size");
+        require(c.page_size > 0 && c.capacity % c.page_size == 0 && c.capacity <= 4096 &&
+                    c.dim <= 256,
+                "unsupported plugin page geometry");
+    }
     return c;
 }
 
 Engine::Engine(std::unique_ptr<ITrtModule> module, Contract contract)
-    : module_(std::move(module)), contract_(contract) {
+    : module_(std::move(module)), contract_(contract),
+      layout_(contract.capacity, contract.page_size) {
     require(module_ && module_->ok(), "invalid execution module");
     const auto& c = contract_;
-    for (const auto* name : {"token_id", "position_id", "logits_indices", "attention_mask",
-                             "cache_write_indices", "key_value_lengths"}) {
+    for (const auto* name :
+         {"token_id", "position_id", "logits_indices", "attention_mask", "key_value_lengths"}) {
         require(module_->has_input(name) && module_->tensor_dtype(name) == DType::kInt32,
                 std::string("missing or mistyped input ") + name);
     }
@@ -62,9 +81,26 @@ Engine::Engine(std::unique_ptr<ITrtModule> module, Contract contract)
     require(module_->input_profile_shape("attention_mask", 0, ProfileShapeSelector::kMax) ==
                 std::vector<std::int64_t>({c.max_query, c.capacity}),
             "visibility profile mismatch");
-    for (const auto* name : {"cache_write_indices", "key_value_lengths"})
+    for (const auto* name : {"key_value_lengths"})
         require(module_->tensor_shape(name) == std::vector<std::int64_t>{1},
                 "invalid state scalar shape");
+    if (c.page_size) {
+        for (const auto* name : {"key_write_slots", "value_write_slots"})
+            require(module_->has_input(name) && module_->tensor_dtype(name) == DType::kInt32 &&
+                        module_->input_profile_shape(name, 0, ProfileShapeSelector::kMax) ==
+                            std::vector<std::int64_t>({1, c.max_query}),
+                    "invalid indexed slot input");
+        for (const auto* name : {"key_pages", "value_pages"})
+            require(module_->has_input(name) && module_->tensor_dtype(name) == DType::kInt32 &&
+                        module_->tensor_shape(name) ==
+                            std::vector<std::int64_t>({1, c.capacity / c.page_size}),
+                    "invalid page table input");
+    } else {
+        require(module_->has_input("cache_write_indices") &&
+                    module_->tensor_dtype("cache_write_indices") == DType::kInt32 &&
+                    module_->tensor_shape("cache_write_indices") == std::vector<std::int64_t>{1},
+                "invalid linear write index");
+    }
     for (const auto* name : {"logits", "features"}) {
         const auto output_shape = module_->tensor_shape(name);
         const int width = name[0] == 'l' ? c.vocab : (c.draft ? c.hidden : c.feature_width);
@@ -80,7 +116,8 @@ Engine::Engine(std::unique_ptr<ITrtModule> module, Contract contract)
                     std::string("conditioning contract mismatch: ") + name);
         }
     }
-    const std::vector<std::int64_t> shape{1, c.heads, c.capacity, c.dim};
+    const std::vector<std::int64_t> shape{c.page_size ? c.capacity / c.page_size : 1, c.heads,
+                                          c.page_size ? c.page_size : c.capacity, c.dim};
     for (int layer = 0; layer < c.layers; ++layer) {
         keys_.push_back(DeviceTensor::zeros(shape, DType::kFloat16, module_->stream()));
         values_.push_back(DeviceTensor::zeros(shape, DType::kFloat16, module_->stream()));
@@ -97,11 +134,27 @@ Engine::Engine(std::unique_ptr<ITrtModule> module, Contract contract)
             auto& tensor = kind[0] == 'k' ? keys_.back() : values_.back();
             require(tensor.ok(), "KV allocation failed");
             module_->bind_external(input, tensor.data());
-            // TensorRT must declare the alias so the compiler sees the state
-            // effect. Binding two unrelated tensors to one pointer is not an
-            // implementation of this contract, including for plugin lowerings.
+            if (c.page_size) {
+#ifdef TRTMC_LLAMA_ATTENTION_STATE_PLUGINS
+                auto registration =
+                    std::shared_ptr<void>(tensor.data(), trtmcAttentionStateUnregister);
+                require(trtmcAttentionStateRegister(tensor.data(),
+                                                    std::size_t(c.heads) * c.capacity * c.dim * 2),
+                        "cache registration failed");
+                cache_registrations_.push_back(std::move(registration));
+                // V3 declares local aliasing. The runtime identity guard rejects
+                // compiler-inserted cache copies; this is explicitly a weaker
+                // build-time guarantee than future requireOutputAlias support.
+                module_->bind_external(output, tensor.data());
+#else
+                throw std::runtime_error("rebuild with TRTMC_LLAMA_ATTENTION_STATE_PLUGINS=ON");
+#endif
+            }
+            // Native v1 bindings are propagated only through TensorRT's engine
+            // alias metadata. Plugin v2 additionally checks the actual addresses
+            // at enqueue; equal external bindings alone are insufficient.
             require(module_->device_ptr(output) == tensor.data(),
-                    "engine does not declare the required cache alias: " + output);
+                    "required cache allocation binding is missing: " + output);
         }
     }
     module_->sync();
@@ -139,9 +192,25 @@ StepResult Engine::run(const std::vector<std::int32_t>& tokens, int start,
         {"logits_indices",
          {selected.data(), {static_cast<std::int64_t>(selected.size())}, DType::kInt32}},
         {"attention_mask", {mask.data(), {rows, c.capacity}, DType::kInt32}},
-        {"cache_write_indices", {&write_start, {1}, DType::kInt32}},
         {"key_value_lengths", {&length, {1}, DType::kInt32}},
     };
+    std::vector<std::int32_t> key_slots(rows), value_slots(rows);
+    if (c.page_size) {
+        for (int row = 0; row < rows; ++row) {
+            key_slots[row] = layout_.slot(start + row, true);
+            value_slots[row] = layout_.slot(start + row, false);
+        }
+        inputs["key_write_slots"] = {key_slots.data(), {1, rows}, DType::kInt32};
+        inputs["value_write_slots"] = {value_slots.data(), {1, rows}, DType::kInt32};
+        inputs["key_pages"] = {const_cast<std::int32_t*>(layout_.pages(true).data()),
+                               {1, c.capacity / c.page_size},
+                               DType::kInt32};
+        inputs["value_pages"] = {const_cast<std::int32_t*>(layout_.pages(false).data()),
+                                 {1, c.capacity / c.page_size},
+                                 DType::kInt32};
+    } else {
+        inputs["cache_write_indices"] = {&write_start, {1}, DType::kInt32};
+    }
     if (c.draft) {
         require(target_features.size() == static_cast<std::size_t>(rows) * c.feature_width &&
                     draft_features.size() == static_cast<std::size_t>(rows) * c.hidden,
@@ -177,18 +246,23 @@ void Engine::commit(int start, const std::vector<std::int32_t>& rows) {
     require(scratch.ok(), "commit scratch allocation failed");
     const auto width = static_cast<std::size_t>(c.dim) * sizeof(std::uint16_t);
     for (auto* storage : {&keys_, &values_}) {
+        const bool key = storage == &keys_;
         for (auto& cache : *storage) {
             for (std::size_t row = 0; row < rows.size(); ++row) {
                 checked(cudaMemcpy2DAsync(
                     static_cast<char*>(scratch.data()) + row * width, rows.size() * width,
-                    static_cast<char*>(cache.data()) + (start + rows[row]) * width,
-                    c.capacity * width, width, c.heads, cudaMemcpyDeviceToDevice,
+                    static_cast<char*>(cache.data()) +
+                        layout_.offset(start + rows[row], key, c.heads, c.dim) * 2,
+                    layout_.head_stride() * width, width, c.heads, cudaMemcpyDeviceToDevice,
                     module_->stream()));
             }
-            checked(cudaMemcpy2DAsync(static_cast<char*>(cache.data()) + start * width,
-                                      c.capacity * width, scratch.data(), rows.size() * width,
-                                      rows.size() * width, c.heads, cudaMemcpyDeviceToDevice,
-                                      module_->stream()));
+            for (std::size_t row = 0; row < rows.size(); ++row)
+                checked(cudaMemcpy2DAsync(static_cast<char*>(cache.data()) +
+                                              layout_.offset(start + row, key, c.heads, c.dim) * 2,
+                                          layout_.head_stride() * width,
+                                          static_cast<char*>(scratch.data()) + row * width,
+                                          rows.size() * width, width, c.heads,
+                                          cudaMemcpyDeviceToDevice, module_->stream()));
         }
     }
     module_->sync();

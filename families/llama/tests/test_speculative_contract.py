@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
+from dataclasses import replace
 
 from ..speculative.contract import EngineContract, tree_visibility
 
@@ -25,3 +26,17 @@ def test_contract_rejects_incompatible_precision_and_capacity():
         EngineContract(**fields, precision="bf16")
     with pytest.raises(ValueError):
         EngineContract(**fields, max_query=2049)
+
+
+def test_paged_contract_is_explicit_and_rejects_incompatible_geometry():
+    contract = EngineContract(
+        "target", 32, 4096, 8, 128, 128256, 2048, feature_width=12288,
+        version=2, attention_backend="plugin", page_size=64,
+        cache_layout="pages_heads_slots_dim", cache_update="aliased_indexed_write",
+        alias_contract="plugin_local_alias_runtime_identity_guard")
+    assert contract.to_dict()["page_size"] == 64
+    for changes in ({"page_size": 0}, {"page_size": 63}, {"capacity": 8192},
+                    {"head_dim": 512}, {"alias_contract": "engine_required_alias"},
+                    {"version": 1}, {"attention_backend": "primitives"}):
+        with pytest.raises(ValueError):
+            replace(contract, **changes)

@@ -34,7 +34,17 @@ class Graph:
         self.tokens = self.input("token_id", trt.int32, (-1,))
         self.positions = self.input("position_id", trt.int32, (-1,))
         self.selected = self.input("logits_indices", trt.int32, (-1,))
-        self.write_start = self.input("cache_write_indices", trt.int32, (1,))
+        self.state_graph = None
+        if contract.attention_backend == "plugin":
+            from .attention_state import AttentionStateGraph
+            self.state_graph = AttentionStateGraph(self.network, self.build_config)
+            pages = contract.capacity // contract.page_size
+            self.key_slots = self.input("key_write_slots", trt.int32, (1, -1))
+            self.value_slots = self.input("value_write_slots", trt.int32, (1, -1))
+            self.key_pages = self.input("key_pages", trt.int32, (1, pages))
+            self.value_pages = self.input("value_pages", trt.int32, (1, pages))
+        else:
+            self.write_start = self.input("cache_write_indices", trt.int32, (1,))
         self.length = self.input("key_value_lengths", trt.int32, (1,))
         # INT32 matches the Edge tree-mask convention and the backend Tensor ABI.
         mask = self.input("attention_mask", trt.int32, (-1, contract.capacity))
@@ -105,7 +115,8 @@ class Graph:
             self.network, k, c.kv_heads, c.head_dim,
             self.cos, self.sin, None, c.head_dim, sequence_length=None,
         )
-        shape = (1, c.kv_heads, c.capacity, c.head_dim)
+        shape = ((c.capacity // c.page_size, c.kv_heads, c.page_size, c.head_dim)
+                 if self.state_graph else (1, c.kv_heads, c.capacity, c.head_dim))
         cache_k = self.input(f"cache_k_{layer}", trt.float16, shape)
         cache_v = self.input(f"cache_v_{layer}", trt.float16, shape)
         # This is the lowering seam: all state effects remain explicit graph
@@ -113,17 +124,36 @@ class Graph:
         k4 = ops.reshape_rows_to_heads_4d(self.network, k, c.kv_heads, c.head_dim, None)
         v4 = ops.reshape_rows_to_heads_4d(self.network, v, c.kv_heads, c.head_dim, None)
         q4 = ops.reshape_rows_to_heads_4d(self.network, q, cfg.num_attention_heads, c.head_dim, None)
-        updated_k = self.network.add_kv_cache_update(
-            cache_k, k4, self.write_start, trt.KVCacheMode.LINEAR
-        ).get_output(0)
-        updated_v = self.network.add_kv_cache_update(
-            cache_v, v4, self.write_start, trt.KVCacheMode.LINEAR
-        ).get_output(0)
-        context = add_explicit_masked_grouped_query_attention(
-            self.network, q4, updated_k, updated_v, self.masks,
-            num_heads=cfg.num_attention_heads, num_kv_heads=c.kv_heads,
-            head_dim=c.head_dim, tag=f"{prefix}.spec_attention",
-        )
+        if self.state_graph:
+            from .attention_state import KVCacheMode
+            updated_k = self.state_graph.add_kv_cache_update(
+                cache_k, k4, self.key_slots, KVCacheMode.INDEXED).get_output(0)
+            updated_v = self.state_graph.add_kv_cache_update(
+                cache_v, v4, self.value_slots, KVCacheMode.INDEXED).get_output(0)
+            scale = self.constant(np.full((1, 1, 1, 1), c.head_dim ** -0.5, dtype=np.float32))
+            scaled = self.network.add_elementwise(
+                self.network.add_cast(q4, trt.float32).get_output(0), scale,
+                trt.ElementWiseOperation.PROD).get_output(0)
+            scaled = self.network.add_cast(scaled, trt.float16).get_output(0)
+            attention = self.state_graph.add_attention_v2(
+                scaled, updated_k, updated_v, trt.AttentionNormalizationOp.SOFTMAX,
+                trt.CausalMaskKind.NONE)
+            attention.set_key_value_page_tables(self.key_pages, self.value_pages)
+            attention.key_value_lengths = self.length
+            attention.mask = self.masks.attention
+            context = attention.get_output(0)
+        else:
+            updated_k = self.network.add_kv_cache_update(
+                cache_k, k4, self.write_start, trt.KVCacheMode.LINEAR
+            ).get_output(0)
+            updated_v = self.network.add_kv_cache_update(
+                cache_v, v4, self.write_start, trt.KVCacheMode.LINEAR
+            ).get_output(0)
+            context = add_explicit_masked_grouped_query_attention(
+                self.network, q4, updated_k, updated_v, self.masks,
+                num_heads=cfg.num_attention_heads, num_kv_heads=c.kv_heads,
+                head_dim=c.head_dim, tag=f"{prefix}.spec_attention",
+            )
         self.output(updated_k, f"present_k_{layer}")
         self.output(updated_v, f"present_v_{layer}")
         rows = ops.reshape_heads_4d_to_rows(
@@ -146,6 +176,8 @@ class Graph:
         self.output(self.network.add_cast(logits, trt.float32).get_output(0), "logits")
 
     def finish(self):
+        if self.state_graph:
+            self.state_graph.validate_effects()
         self.build_config.add_optimization_profile(self.profile)
         result = self.builder.build_serialized_network(self.network, self.build_config)
         if result is None:

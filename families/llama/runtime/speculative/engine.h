@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include "families/llama/runtime/speculative/state_layout.h"
 #include "trtmc/runtime/trt_module.h"
 
 #include <memory>
@@ -15,6 +16,7 @@ namespace trtmc::llama::speculative {
 struct Contract {
     int layers, hidden, heads, dim, vocab, capacity, max_query, feature_width;
     bool draft;
+    int page_size = 0;
     static Contract parse(const nlohmann::json& value);
 };
 
@@ -41,7 +43,9 @@ class Engine {
   private:
     std::unique_ptr<ITrtModule> module_;
     Contract contract_;
+    StateLayout layout_;
     std::vector<DeviceTensor> keys_, values_;
+    std::vector<std::shared_ptr<void>> cache_registrations_;
 };
 
 // Host policy helpers; independent of engine lowering and tested without a GPU.

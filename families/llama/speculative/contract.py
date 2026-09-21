@@ -27,14 +27,27 @@ class EngineContract:
     precision: str = "fp16"
     cache_layout: str = "batch_heads_capacity_dim"
     cache_update: str = "aliased_contiguous_append"
+    attention_backend: str = "primitives"
+    page_size: int = 0
+    alias_contract: str = "engine_required_alias"
 
     def __post_init__(self):
-        if self.version != 1 or self.role not in {"target", "draft"}:
+        if self.version not in {1, 2} or self.role not in {"target", "draft"}:
             raise ValueError("unsupported speculative engine contract")
         if self.precision != "fp16":
             raise ValueError("the first speculative ABI supports FP16 only")
-        if (self.cache_layout != "batch_heads_capacity_dim"
-                or self.cache_update != "aliased_contiguous_append"):
+        linear = (self.version == 1 and self.attention_backend == "primitives"
+                  and self.cache_layout == "batch_heads_capacity_dim"
+                  and self.cache_update == "aliased_contiguous_append"
+                  and self.page_size == 0 and self.alias_contract == "engine_required_alias")
+        paged = (self.version == 2 and self.attention_backend == "plugin"
+                 and self.cache_layout == "pages_heads_slots_dim"
+                 and self.cache_update == "aliased_indexed_write"
+                 and self.alias_contract == "plugin_local_alias_runtime_identity_guard"
+                 and type(self.page_size) is int and self.page_size > 0
+                 and self.capacity % self.page_size == 0 and self.capacity <= 4096
+                 and self.head_dim <= 256)
+        if not (linear or paged):
             raise ValueError("unsupported speculative state layout or effects")
         for name in ("layers", "hidden_size", "kv_heads", "head_dim", "vocab_size",
                      "capacity", "max_query", "feature_width"):

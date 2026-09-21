@@ -37,6 +37,11 @@ install(TARGETS trtmc_model_llama
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 
+option(TRTMC_LLAMA_ATTENTION_STATE_PLUGINS "Build standalone indexed KV/paged attention plugins" OFF)
+if(TRTMC_LLAMA_ATTENTION_STATE_PLUGINS)
+  add_subdirectory(attention_state)
+endif()
+
 if(TRTMC_BUILD_TESTS)
   add_executable(llama_speculative_validation
     ${PROJECT_SOURCE_DIR}/families/llama/tests/cpp/speculative_validation.cpp)

@@ -11,6 +11,10 @@
 int main() {
     using trtmc::llama::speculative::greedy_path;
     try {
+        trtmc::llama::speculative::StateLayout layout(16, 4);
+        if (layout.slot(3, true) != 15 || layout.slot(4, true) != 8 || layout.slot(4, false) != 4 ||
+            layout.offset(4, true, 2, 8) != 128 || layout.head_stride() != 4)
+            throw std::runtime_error("logical/physical page mapping mismatch");
         // Greedy target picks sibling row 2, then its child row 4. Physical
         // row order differs from the logical accepted path.
         const std::vector<std::int32_t> tokens{0, 1, 2, 3, 1};

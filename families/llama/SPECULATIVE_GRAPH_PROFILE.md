@@ -8,8 +8,10 @@ cost, concentrated in target verification attention.
 This profiles the split-profile, 1024-token-prefill bundles from the
 [execution-profile experiment](SPECULATIVE_PROFILES_PERFORMANCE.md), using
 Nsight Systems CUDA/NVTX traces on September 22, 2026. No engines were rebuilt.
-The production runtime is unchanged. An isolated diagnostic confirms the
-largest CPU bottleneck without removing validation.
+Baseline captures use the production runtime plus instrumentation. An isolated
+diagnostic confirms the largest CPU bottleneck without removing validation.
+The subsequent [host-runtime follow-up](SPECULATIVE_HOST_RUNTIME.md) lands the
+allocation fix and describes the next device-residency work.
 
 ## Request decomposition
 
@@ -80,8 +82,9 @@ GPU work. Plugin GPU execution was slower in its later diagnostic capture;
 the measured 190.54 ms reduction in idle time is more useful for attributing
 this CPU change than its total traced speedup. Clocks were not locked.
 
-This diagnostic is retained outside the repository in the profiling artifacts;
-it has **not** been applied to the production runtime.
+These diagnostic measurements preceded the production fix. Their source is
+retained in the profiling artifacts; see the host-runtime follow-up for the
+later implementation and its separate validation.
 
 ## What differs in the GPU graph
 
@@ -186,7 +189,8 @@ ranges. This capture does not individually attribute every remaining CPU gap.
 Chain mode makes no explicit `Engine::commit` calls, so tree cache-compaction
 cost is not a bottleneck demonstrated by this experiment.
 
-Recommended implementation order:
+Implementation order identified by this profile (the host-runtime follow-up
+implements step 1):
 
 1. Remove the per-logit temporary-string construction while preserving finite
    validation. This is the directly confirmed, lowest-scope improvement.

@@ -345,8 +345,10 @@ void Engine::reset() {
 
 std::int32_t argmax(const float* values, int count) {
     require(count > 0, "empty logits");
+    // Construct the error message only on failure, not once per finite logit.
     for (int index = 0; index < count; ++index)
-        require(std::isfinite(values[index]), "non-finite logits");
+        if (!std::isfinite(values[index]))
+            require(false, "non-finite logits");
     return static_cast<std::int32_t>(std::max_element(values, values + count) - values);
 }
 

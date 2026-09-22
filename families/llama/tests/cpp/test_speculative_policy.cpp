@@ -9,8 +9,41 @@
 #include <stdexcept>
 
 int main() {
+    using trtmc::llama::speculative::argmax;
     using trtmc::llama::speculative::greedy_path;
     try {
+        const float tied_logits[]{-3.0F, 7.0F, 7.0F, -1.0F};
+        const float negative_logits[]{-5.0F, -1.0F, -3.0F};
+        const float zero_logits[]{0.0F, -0.0F, 0.0F};
+        if (argmax(tied_logits, 4) != 1 || argmax(negative_logits, 3) != 1 ||
+            argmax(zero_logits, 3) != 0 || argmax(negative_logits, 1) != 0)
+            throw std::runtime_error("argmax changed finite values or first-index tie breaking");
+        for (const float invalid :
+             {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
+              -std::numeric_limits<float>::infinity()}) {
+            for (const int position : {0, 1, 3}) {
+                std::vector<float> values(tied_logits, tied_logits + 4);
+                values[position] = invalid;
+                bool rejected = false;
+                try {
+                    argmax(values.data(), static_cast<int>(values.size()));
+                } catch (const std::invalid_argument&) {
+                    rejected = true;
+                }
+                if (!rejected)
+                    throw std::runtime_error("argmax accepted non-finite logits");
+            }
+        }
+        for (const int count : {0, -1}) {
+            bool rejected = false;
+            try {
+                argmax(nullptr, count);
+            } catch (const std::invalid_argument&) {
+                rejected = true;
+            }
+            if (!rejected)
+                throw std::runtime_error("argmax accepted an empty logit range");
+        }
         using trtmc::llama::speculative::Contract;
         using trtmc::llama::speculative::Phase;
         auto manifest = nlohmann::json::parse(R"({

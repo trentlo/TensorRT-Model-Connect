@@ -18,11 +18,10 @@ struct CandidateTree {
 class Eagle3 {
   public:
     Eagle3(Engine& draft, const std::vector<std::int32_t>& mapping, int depth, int width);
-    void prefill(const std::vector<std::int32_t>& prompt, int root,
-                 const std::vector<std::uint16_t>& target_features);
+    void prefill(const std::vector<std::int32_t>& prompt, int root, FeatureView target_features);
     CandidateTree propose(int root, int committed, int remaining);
     void feedback(const CandidateTree& tree, const std::vector<std::int32_t>& path,
-                  const std::vector<std::uint16_t>& target_features, int bonus, int committed);
+                  FeatureView target_features, int bonus, int committed);
 
   private:
     Engine& draft_;

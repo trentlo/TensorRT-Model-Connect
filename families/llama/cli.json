@@ -14,6 +14,7 @@
       {"name": "max_query", "flags": ["--max-query"], "type": "int", "default": 64},
       {"name": "execution_profiles", "flags": ["--execution-profiles"], "type": "string", "choices": ["single", "split"], "default": "single"},
       {"name": "prefill_query", "flags": ["--prefill-query"], "type": "int", "default": 64},
+      {"name": "greedy_selection", "flags": ["--greedy-selection"], "type": "string", "choices": ["host", "device_v1"], "default": "host"},
       {"name": "draft_depth", "flags": ["--draft-depth"], "type": "int", "default": 4},
       {"name": "attention_backend", "flags": ["--attention-backend"], "type": "string", "default": "primitives", "choices": ["primitives", "plugin"]},
       {"name": "kv_page_size", "flags": ["--kv-page-size"], "type": "int", "default": 64},

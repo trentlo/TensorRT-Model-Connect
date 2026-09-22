@@ -66,7 +66,8 @@ def build_speculative(*, model_dir: Path, draft_dir: Path, output: Path,
                       draft_depth: int = 4, spec_dec: str = "eagle3", verbose: bool = False,
                       attention_backend: str = "primitives", kv_page_size: int = 64,
                       attention_plugin_library: Path | None = None,
-                      execution_profiles: str = "single", prefill_query: int = 64) -> int:
+                      execution_profiles: str = "single", prefill_query: int = 64,
+                      greedy_selection: str = "host") -> int:
     from .graph import build_draft, build_target
 
     if spec_dec != "eagle3":
@@ -107,7 +108,7 @@ def build_speculative(*, model_dir: Path, draft_dir: Path, output: Path,
     target_contract = EngineContract(
         "target", config.num_hidden_layers, config.hidden_size, config.num_key_value_heads,
         config.head_dim, config.vocab_size, max_sequence_length, target_max, 3 * config.hidden_size,
-        execution_profiles=target_profiles, **state,
+        execution_profiles=target_profiles, greedy_selection=greedy_selection, **state,
     )
     weights = load_standard_weights(model_dir, config, precision="fp16")
     draft_config, draft_weights, mapping = load_draft(draft_dir, weights["embedding"])
@@ -117,7 +118,7 @@ def build_speculative(*, model_dir: Path, draft_dir: Path, output: Path,
         "draft", draft_config.num_hidden_layers, draft_config.hidden_size,
         draft_config.num_key_value_heads, draft_config.head_dim, len(mapping),
         max_sequence_length, draft_max, 3 * config.hidden_size,
-        execution_profiles=draft_profiles, **state,
+        execution_profiles=draft_profiles, greedy_selection=greedy_selection, **state,
     )
     writer = BundleWriter(output)
     runtime_metadata = _runtime_config(model_dir, config)
@@ -136,6 +137,8 @@ def build_speculative(*, model_dir: Path, draft_dir: Path, output: Path,
         del weights
         print("Compiling EAGLE3 draft...", flush=True)
         writer.add_bytes("draft.plan", build_draft(draft_config, draft_weights, draft_contract, verbose=verbose))
+        from .selection import add_selection_plans
+        add_selection_plans(writer, target_contract, draft_contract, verbose=verbose)
         for filename in _BUNDLE_FILES:
             path = model_dir / filename
             if path.is_file():

@@ -26,6 +26,9 @@ def test_contract_rejects_incompatible_precision_and_capacity():
         EngineContract(**fields, precision="bf16")
     with pytest.raises(ValueError):
         EngineContract(**fields, max_query=2049)
+    with pytest.raises(ValueError):
+        EngineContract(**fields, greedy_selection="unknown")
+    assert EngineContract(**fields, greedy_selection="device_v1").to_dict()["greedy_selection"] == "device_v1"
 
 
 def test_paged_contract_is_explicit_and_rejects_incompatible_geometry():

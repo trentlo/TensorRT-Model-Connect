@@ -32,18 +32,15 @@ Eagle3::Eagle3(Engine& draft, const std::vector<std::int32_t>& mapping, int dept
 }
 
 void Eagle3::prefill(const std::vector<std::int32_t>& prompt, int root,
-                     const std::vector<std::uint16_t>& target_features) {
+                     FeatureView target_features) {
     const auto& c = draft_.contract();
     auto shifted = slice(prompt, 1, prompt.size());
     shifted.push_back(root);
     for (int start = 0; start < static_cast<int>(prompt.size());) {
         const int rows =
             std::min(c.query_limit(Phase::kPrefill), static_cast<int>(prompt.size()) - start);
-        result_ = draft_.run(
-            Phase::kPrefill, slice(shifted, start, start + rows), start, chain(rows), false,
-            slice(target_features, static_cast<std::size_t>(start) * c.feature_width,
-                  static_cast<std::size_t>(start + rows) * c.feature_width),
-            std::vector<std::uint16_t>(static_cast<std::size_t>(rows) * c.hidden, 0));
+        result_ = draft_.run(Phase::kPrefill, slice(shifted, start, start + rows), start,
+                             chain(rows), false, target_features.slice(start, rows));
         start += rows;
     }
 }
@@ -56,7 +53,7 @@ CandidateTree Eagle3::propose(int root, int committed, int remaining) {
     CandidateTree tree{{root}, {-1}};
     int predecessor = 0;
     for (int step = 0; step < depth; ++step) {
-        const int best = argmax(result_.logits.data(), c.vocab);
+        const int best = result_.token();
         const int candidate = mapping_[best];
         const int best_row = static_cast<int>(tree.tokens.size());
         tree.tokens.push_back(candidate);
@@ -64,40 +61,30 @@ CandidateTree Eagle3::propose(int root, int committed, int remaining) {
         if (width_ == 2) {
             // Expose a sibling at each depth and expand the best branch.
             // Full beam scoring and pruning are a separate future policy.
-            int second = best == 0 ? 1 : 0;
-            for (int index = 0; index < c.vocab; ++index) {
-                if (index != best && result_.logits[index] > result_.logits[second])
-                    second = index;
-            }
+            const int second = result_.token(0, 1);
             tree.tokens.push_back(mapping_[second]);
             tree.parents.push_back(predecessor);
         }
         predecessor = best_row;
         if (step + 1 < depth) {
-            auto recurrent = slice(result_.features, result_.features.size() - c.hidden,
-                                   result_.features.size());
-            result_ = draft_.run(Phase::kDecode, {candidate}, committed + step, {-1}, false,
-                                 std::vector<std::uint16_t>(c.feature_width, 0), recurrent);
+            const auto recurrent = result_.features.slice(result_.features.rows - 1, 1);
+            result_ = draft_.run(Phase::kDecode, {candidate}, committed + step, {-1}, false, {},
+                                 recurrent);
         }
     }
     return tree;
 }
 
 void Eagle3::feedback(const CandidateTree& tree, const std::vector<std::int32_t>& path,
-                      const std::vector<std::uint16_t>& target_features, int bonus, int committed) {
-    const auto& c = draft_.contract();
+                      FeatureView target_features, int bonus, int committed) {
     std::vector<std::int32_t> tokens;
-    std::vector<std::uint16_t> features;
     // Replace recurrent proposals with verified target features. Pair each
     // feature with the following accepted token, ending with the pending bonus.
     for (std::size_t index = 0; index < path.size(); ++index) {
         tokens.push_back(index + 1 < path.size() ? tree.tokens[path[index + 1]] : bonus);
-        const auto offset = static_cast<std::size_t>(path[index]) * c.feature_width;
-        const auto row = slice(target_features, offset, offset + c.feature_width);
-        features.insert(features.end(), row.begin(), row.end());
     }
     result_ = draft_.run(Phase::kDecode, tokens, committed, chain(static_cast<int>(tokens.size())),
-                         false, features, std::vector<std::uint16_t>(tokens.size() * c.hidden, 0));
+                         false, target_features, {}, path);
 }
 
 } // namespace trtmc::llama::speculative

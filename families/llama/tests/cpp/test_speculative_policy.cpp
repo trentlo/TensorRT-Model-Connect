@@ -55,6 +55,21 @@ int main() {
             {"phase":"prefill","query":[1,1024,1024],"logits":[1,1,1]},
             {"phase":"decode","query":[1,5,9],"logits":[1,5,9]}]})");
         auto contract = Contract::parse(manifest);
+        if (contract.device_selection)
+            throw std::runtime_error("legacy bundle enabled device selection implicitly");
+        manifest["greedy_selection"] = "device_v1";
+        if (!Contract::parse(manifest).device_selection)
+            throw std::runtime_error("device selection capability was ignored");
+        manifest["greedy_selection"] = "unknown";
+        bool unknown_selection = false;
+        try {
+            Contract::parse(manifest);
+        } catch (const std::invalid_argument&) {
+            unknown_selection = true;
+        }
+        if (!unknown_selection)
+            throw std::runtime_error("unknown selection capability was accepted");
+        manifest.erase("greedy_selection");
         if (contract.query_limit(Phase::kPrefill) != 1024 ||
             contract.query_limit(Phase::kDecode) != 9)
             throw std::runtime_error("phase query limits are not independent");
@@ -96,6 +111,43 @@ int main() {
         logits[2 * 4 + 1] = 4;
         if (greedy_path(tokens, parents, logits, 4) != std::vector<std::int32_t>({0, 2, 4}))
             throw std::runtime_error("branch acceptance chose the wrong path");
+        trtmc::llama::speculative::StepResult compact;
+        compact.vocab = 4;
+        compact.ranks = 1;
+        compact.selection = {2, 1, 0, 0, 1, 1, 0, 0, 0, 1};
+        if (greedy_path(tokens, parents, compact) != std::vector<std::int32_t>({0, 2, 4}))
+            throw std::runtime_error(
+                "compact branch acceptance changed path or checked unused rows");
+        compact.selection[5] = 0;
+        bool bad_selection = false;
+        try {
+            greedy_path(tokens, parents, compact);
+        } catch (const std::invalid_argument&) {
+            bad_selection = true;
+        }
+        if (!bad_selection)
+            throw std::runtime_error("compact selection accepted a consumed non-finite row");
+        compact.ranks = 2;
+        compact.selection = {1, 2, 1};
+        if (compact.token() != 1 || compact.token(0, 1) != 2)
+            throw std::runtime_error("compact draft rank order changed");
+        compact.selection.clear();
+        compact.logits = {-3.0F, 7.0F, 7.0F, -1.0F};
+        if (compact.token() != 1 || compact.token(0, 1) != 2)
+            throw std::runtime_error("host draft rank order changed");
+        std::uint16_t feature_data[12]{};
+        trtmc::llama::speculative::FeatureView features{feature_data, 3, 4};
+        const auto last = features.slice(2, 1);
+        if (last.data != feature_data + 8 || last.rows != 1 || last.width != 4)
+            throw std::runtime_error("device feature row offset changed");
+        bool bad_slice = false;
+        try {
+            features.slice(2, 2);
+        } catch (const std::invalid_argument&) {
+            bad_slice = true;
+        }
+        if (!bad_slice)
+            throw std::runtime_error("out-of-bounds device feature view was accepted");
         logits[2] = 0;
         logits[3] = 5;
         if (greedy_path(tokens, parents, logits, 4) != std::vector<std::int32_t>({0}))

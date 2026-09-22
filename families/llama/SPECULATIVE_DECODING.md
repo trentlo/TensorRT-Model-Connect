@@ -23,6 +23,7 @@ native MC, plugin MC and Edge-LLM separately from the correctness runs below.
 
 - `speculative/contract.py`: versioned compiler/runtime tensor and state ABI.
 - `speculative/graph.py`: target and draft graphs and the attention lowering seam.
+- `speculative/selection.py`: optional TensorRT graph for compact greedy decisions.
 - `speculative/build.py`: checkpoint mapping and bundle composition.
 - `runtime/speculative/engine.*`: ABI validation, bindings, execution and KV copies.
 - `runtime/speculative/eagle3.*`: method-specific conditioning, proposal and feedback.
@@ -62,8 +63,9 @@ visibility, depth-based positions and noncontiguous accepted-path compaction.
 `speculative.json` names two engine contracts and the EAGLE3 configuration.
 For either engine, let `Q` be query rows, `M` selected logits rows, `C` fixed
 cache capacity, `Hkv` KV heads, and `D` head dimension. All tensors are dense,
-contiguous, batch one. Runtime pointers are device pointers after the backend
-copies the supplied host inputs. Tensor names are part of the ABI.
+contiguous, batch one. All execution bindings are device pointers. Token and
+visibility control inputs are uploaded; conditioning features stay on device.
+Tensor names are part of the ABI.
 
 | Binding | Direction/type/shape | Meaning |
 |---|---|---|
@@ -135,12 +137,14 @@ describes that graph contract; it is not a replacement for compiler-visible
 state effects. The runtime rejects engines whose cache outputs are not declared
 as aliases of their inputs; manually binding unrelated tensors to the same
 address does not satisfy this contract. TensorRT owns engine workspace.
-The runtime owns KV buffers,
-host input/output storage and temporary compaction storage. Every execution
-and copy uses its module's CUDA stream. This prototype synchronizes before
-returning outputs and before crossing between the target and draft streams.
-Thus host staging is safe but adds overhead. An asynchronous implementation
-must preserve these dependencies with events and buffer lifetimes.
+The runtime owns KV buffers, input staging and reusable compaction storage.
+Every execution and copy uses its module's CUDA stream. Feature outputs are
+borrowed device views, completed before return and valid until the producer's
+next invocation/reset/destruction. Draft inputs are staged into separate device
+buffers before enqueue, preserving recurrent output lifetime without input/output
+aliasing. Prompt features are accumulated on the target stream and completed
+before draft prefill. See the [resident runtime contract](SPECULATIVE_RESIDENT_RUNTIME.md)
+for the optional selector's cross-stream dependency and numerical semantics.
 
 Only initialized visible slots may affect attention. The current lowering
 sanitizes inactive cache rows before matmuls, so masked stale NaNs cannot

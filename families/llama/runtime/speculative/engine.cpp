@@ -22,6 +22,31 @@ void require(bool condition, const std::string& message) {
     if (!condition)
         throw std::invalid_argument("speculative ABI: " + message);
 }
+
+template <typename Select>
+std::vector<std::int32_t> walk_greedy_path(const std::vector<std::int32_t>& tokens,
+                                           const std::vector<std::int32_t>& parents,
+                                           Select select) {
+    require(!tokens.empty() && parents.size() == tokens.size() && parents[0] == -1,
+            "invalid verification rows");
+    for (std::size_t row = 1; row < parents.size(); ++row)
+        require(parents[row] >= 0 && parents[row] < static_cast<int>(row), "invalid tree");
+    std::vector<std::int32_t> path{0};
+    for (;;) {
+        const auto parent = path.back();
+        const auto next = select(parent);
+        auto found = tokens.size();
+        for (std::size_t row = parent + 1; row < tokens.size(); ++row) {
+            if (parents[row] == parent && tokens[row] == next) {
+                found = row;
+                break;
+            }
+        }
+        if (found == tokens.size())
+            return path;
+        path.push_back(static_cast<std::int32_t>(found));
+    }
+}
 } // namespace
 
 Contract Contract::parse(const nlohmann::json& value) {
@@ -47,6 +72,10 @@ Contract Contract::parse(const nlohmann::json& value) {
                 c.capacity > 0 && c.max_query > 0 && c.max_query <= c.capacity &&
                 c.feature_width > 0,
             "invalid dimensions");
+    const auto selection = value.value("greedy_selection", "host");
+    require(selection == "host" || selection == "device_v1", "unsupported greedy selection");
+    c.device_selection = selection == "device_v1";
+    require(!c.device_selection || !c.draft || c.vocab >= 2, "draft selection needs two tokens");
     if (paged) {
         c.page_size = value.at("page_size");
         require(c.page_size > 0 && c.capacity % c.page_size == 0 && c.capacity <= 4096 &&
@@ -88,11 +117,37 @@ Contract Contract::parse(const nlohmann::json& value) {
 }
 
 Engine::Engine(std::unique_ptr<ITrtModule> module, Contract contract,
-               std::unique_ptr<ITrtModule> prefill)
-    : module_(std::move(module)), prefill_(std::move(prefill)), contract_(contract),
-      layout_(contract.capacity, contract.page_size) {
+               std::unique_ptr<ITrtModule> prefill, std::unique_ptr<ITrtModule> selection)
+    : module_(std::move(module)), prefill_(std::move(prefill)), selection_(std::move(selection)),
+      contract_(contract), layout_(contract.capacity, contract.page_size) {
     require(module_ && module_->ok(), "invalid execution module");
     const auto& c = contract_;
+    require(c.device_selection == (selection_ != nullptr), "selection capability/module mismatch");
+    if (selection_) {
+        const int max_rows = c.profiles.empty()
+                                 ? c.max_query
+                                 : std::max(c.profiles[0].logits[2], c.profiles[1].logits[2]);
+        const int columns = c.draft ? 3 : 2;
+        require(selection_->ok() && selection_->optimization_profile_count() == 1 &&
+                    selection_->has_input("logits") &&
+                    selection_->tensor_dtype("logits") == DType::kFloat32 &&
+                    selection_->has_output("selection") &&
+                    selection_->tensor_dtype("selection") == DType::kInt32 &&
+                    selection_->tensor_shape("selection") ==
+                        std::vector<std::int64_t>({max_rows, columns}) &&
+                    selection_->input_profile_shape("logits", 0, ProfileShapeSelector::kMin) ==
+                        std::vector<std::int64_t>({1, c.vocab}) &&
+                    selection_->input_profile_shape("logits", 0, ProfileShapeSelector::kMax) ==
+                        std::vector<std::int64_t>({max_rows, c.vocab}),
+                "invalid selection engine contract");
+        void* host = nullptr;
+        checked(cudaMallocHost(&host, std::size_t(max_rows) * columns * sizeof(std::int32_t)));
+        selection_host_ = std::shared_ptr<void>(host, [](void* p) { cudaFreeHost(p); });
+        cudaEvent_t ready = nullptr;
+        checked(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+        selection_ready_ = std::shared_ptr<void>(
+            ready, [](void* p) { cudaEventDestroy(static_cast<cudaEvent_t>(p)); });
+    }
     require(c.profiles.empty() == (prefill_ == nullptr), "execution module/profile mismatch");
     if (prefill_)
         require(prefill_->ok() && prefill_->profile_idx() == 0 && module_->profile_idx() == 1 &&
@@ -169,7 +224,14 @@ Engine::Engine(std::unique_ptr<ITrtModule> module, Contract contract,
             require(module_->has_input(name) && module_->tensor_dtype(name) == DType::kFloat16,
                     std::string("conditioning contract mismatch: ") + name);
         }
+        target_input_ =
+            DeviceTensor({c.max_query, c.feature_width}, DType::kFloat16, module_->stream());
+        draft_input_ = DeviceTensor({c.max_query, c.hidden}, DType::kFloat16, module_->stream());
+        require(target_input_.ok() && draft_input_.ok(), "conditioning allocation failed");
     }
+    commit_scratch_ = DeviceTensor({c.heads, c.query_limit(Phase::kDecode), c.dim}, DType::kFloat16,
+                                   module_->stream());
+    require(commit_scratch_.ok(), "commit scratch allocation failed");
     const std::vector<std::int64_t> shape{c.page_size ? c.capacity / c.page_size : 1, c.heads,
                                           c.page_size ? c.page_size : c.capacity, c.dim};
     for (int layer = 0; layer < c.layers; ++layer) {
@@ -223,14 +285,17 @@ Engine::Engine(std::unique_ptr<ITrtModule> module, Contract contract,
 
 StepResult Engine::run(Phase phase, const std::vector<std::int32_t>& tokens, int start,
                        const std::vector<std::int32_t>& parents, bool all_logits,
-                       const std::vector<std::uint16_t>& target_features,
-                       const std::vector<std::uint16_t>& draft_features) {
+                       FeatureView target_features, FeatureView draft_features,
+                       const std::vector<std::int32_t>& feature_rows) {
     const auto& c = contract_;
     const int rows = static_cast<int>(tokens.size());
     require(rows > 0 && rows <= c.query_limit(phase) && start >= 0 && start <= c.capacity - rows,
             "query exceeds engine profile or cache bounds");
     require(parents.size() == tokens.size(), "parent count mismatch");
-    std::vector<std::int32_t> positions(rows), mask(static_cast<std::size_t>(rows) * c.capacity, 0);
+    auto& positions = positions_;
+    auto& mask = mask_;
+    positions.resize(rows);
+    mask.assign(static_cast<std::size_t>(rows) * c.capacity, 0);
     for (int row = 0; row < rows; ++row) {
         require(parents[row] >= -1 && parents[row] < row, "parents must precede children");
         positions[row] = parents[row] < 0 ? start : positions[parents[row]] + 1;
@@ -239,7 +304,8 @@ StepResult Engine::run(Phase phase, const std::vector<std::int32_t>& tokens, int
         for (int ancestor = row; ancestor >= 0; ancestor = parents[ancestor])
             visible[start + ancestor] = 1;
     }
-    std::vector<std::int32_t> selected;
+    auto& selected = selected_;
+    selected.clear();
     if (all_logits) {
         for (int row = 0; row < rows; ++row)
             selected.push_back(row);
@@ -255,7 +321,10 @@ StepResult Engine::run(Phase phase, const std::vector<std::int32_t>& tokens, int
         {"attention_mask", {mask.data(), {rows, c.capacity}, DType::kInt32}},
         {"key_value_lengths", {&length, {1}, DType::kInt32}},
     };
-    std::vector<std::int32_t> key_slots(rows), value_slots(rows);
+    auto& key_slots = key_slots_;
+    auto& value_slots = value_slots_;
+    key_slots.resize(rows);
+    value_slots.resize(rows);
     if (c.page_size) {
         for (int row = 0; row < rows; ++row) {
             key_slots[row] = layout_.slot(start + row, true);
@@ -272,17 +341,39 @@ StepResult Engine::run(Phase phase, const std::vector<std::int32_t>& tokens, int
     } else {
         inputs["cache_write_indices"] = {&write_start, {1}, DType::kInt32};
     }
-    if (c.draft) {
-        require(target_features.size() == static_cast<std::size_t>(rows) * c.feature_width &&
-                    draft_features.size() == static_cast<std::size_t>(rows) * c.hidden,
-                "draft conditioning shape mismatch");
-        inputs["target_features"] = {const_cast<std::uint16_t*>(target_features.data()),
-                                     {rows, c.feature_width},
-                                     DType::kFloat16};
-        inputs["draft_features"] = {
-            const_cast<std::uint16_t*>(draft_features.data()), {rows, c.hidden}, DType::kFloat16};
-    }
     auto& module = phase == Phase::kPrefill && prefill_ ? prefill_ : module_;
+    if (c.draft) {
+        auto stage = [&](const char* name, FeatureView source, DeviceTensor& destination, int width,
+                         const std::vector<std::int32_t>& gather) {
+            const auto bytes = std::size_t(rows) * width * sizeof(std::uint16_t);
+            require(gather.empty() || (source.data && gather.size() == tokens.size()),
+                    "conditioning gather shape mismatch");
+            if (!source.data) {
+                require(source.rows == 0 && source.width == 0, "invalid empty conditioning");
+                checked(cudaMemsetAsync(destination.data(), 0, bytes, module->stream()));
+            } else {
+                require(source.width == width &&
+                            (gather.empty() ? source.rows == rows : source.rows > 0),
+                        "draft conditioning shape mismatch");
+                if (gather.empty()) {
+                    checked(cudaMemcpyAsync(destination.data(), source.data, bytes,
+                                            cudaMemcpyDeviceToDevice, module->stream()));
+                } else {
+                    for (int row = 0; row < rows; ++row) {
+                        const auto view = source.slice(gather[row], 1);
+                        checked(cudaMemcpyAsync(static_cast<std::uint16_t*>(destination.data()) +
+                                                    std::size_t(row) * width,
+                                                view.data,
+                                                std::size_t(width) * sizeof(std::uint16_t),
+                                                cudaMemcpyDeviceToDevice, module->stream()));
+                    }
+                }
+            }
+            module->bind_external(name, destination.data(), {rows, width});
+        };
+        stage("target_features", target_features, target_input_, c.feature_width, feature_rows);
+        stage("draft_features", draft_features, draft_input_, c.hidden, {});
+    }
     if (!c.profiles.empty()) {
         const auto& bounds = c.profiles[phase == Phase::kPrefill ? 0 : 1].logits;
         require(selected.size() >= std::size_t(bounds[0]) &&
@@ -291,15 +382,33 @@ StepResult Engine::run(Phase phase, const std::vector<std::int32_t>& tokens, int
     }
     module->forward_async(inputs);
     StepResult result;
-    result.logits.resize(selected.size() * c.vocab);
-    result.features.resize(static_cast<std::size_t>(rows) * (c.draft ? c.hidden : c.feature_width));
-    checked(cudaMemcpyAsync(result.logits.data(), module->device_ptr("logits"),
-                            result.logits.size() * sizeof(float), cudaMemcpyDeviceToHost,
-                            module->stream()));
-    checked(cudaMemcpyAsync(result.features.data(), module->device_ptr("features"),
-                            result.features.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost,
-                            module->stream()));
-    module->sync();
+    result.vocab = c.vocab;
+    if (selection_) {
+        result.ranks = c.draft ? 2 : 1;
+        // Target/draft and selector contexts may use different streams. The
+        // event orders the borrowed logits; the final sync completes both.
+        auto ready = static_cast<cudaEvent_t>(selection_ready_.get());
+        checked(cudaEventRecord(ready, module->stream()));
+        checked(cudaStreamWaitEvent(selection_->stream(), ready, 0));
+        selection_->bind_external("logits", module->device_ptr("logits"),
+                                  {static_cast<std::int64_t>(selected.size()), c.vocab});
+        selection_->forward_device_async({});
+        result.selection.resize(selected.size() * (result.ranks + 1));
+        checked(cudaMemcpyAsync(selection_host_.get(), selection_->device_ptr("selection"),
+                                result.selection.size() * sizeof(std::int32_t),
+                                cudaMemcpyDeviceToHost, selection_->stream()));
+        checked(cudaStreamSynchronize(selection_->stream()));
+        std::copy_n(static_cast<const std::int32_t*>(selection_host_.get()),
+                    result.selection.size(), result.selection.begin());
+    } else {
+        result.logits.resize(selected.size() * c.vocab);
+        checked(cudaMemcpyAsync(result.logits.data(), module->device_ptr("logits"),
+                                result.logits.size() * sizeof(float), cudaMemcpyDeviceToHost,
+                                module->stream()));
+        checked(cudaStreamSynchronize(module->stream()));
+    }
+    result.features = {static_cast<const std::uint16_t*>(module->device_ptr("features")), rows,
+                       c.draft ? c.hidden : c.feature_width};
     return result;
 }
 
@@ -309,9 +418,9 @@ void Engine::commit(int start, const std::vector<std::int32_t>& rows) {
             "invalid commit destination");
     for (auto row : rows)
         require(row >= 0 && row < c.max_query && start + row < c.capacity, "invalid commit source");
-    DeviceTensor scratch({c.heads, static_cast<std::int64_t>(rows.size()), c.dim}, DType::kFloat16,
-                         module_->stream());
-    require(scratch.ok(), "commit scratch allocation failed");
+    require(rows.size() <= std::size_t(c.query_limit(Phase::kDecode)),
+            "commit exceeds scratch capacity");
+    auto& scratch = commit_scratch_;
     const auto width = static_cast<std::size_t>(c.dim) * sizeof(std::uint16_t);
     for (auto* storage : {&keys_, &values_}) {
         const bool key = storage == &keys_;
@@ -341,6 +450,51 @@ void Engine::reset() {
     module_->reset_execution_context();
     if (prefill_)
         prefill_->reset_execution_context();
+    if (selection_)
+        selection_->reset_execution_context();
+}
+
+FeatureView FeatureView::slice(int first, int count) const {
+    require(data && width > 0 && count > 0 && first >= 0 && first <= rows - count,
+            "invalid device feature slice");
+    return {data + std::size_t(first) * width, count, width};
+}
+
+std::int32_t StepResult::token(int row, int rank) const {
+    require(row >= 0 && rank >= 0 && rank < 2 && vocab > rank, "invalid selection index");
+    if (!selection.empty()) {
+        require(ranks >= 1 && ranks <= 2 && rank < ranks && selection.size() % (ranks + 1) == 0 &&
+                    std::size_t(row) < selection.size() / (ranks + 1),
+                "invalid compact selection");
+        const auto offset = std::size_t(row) * (ranks + 1);
+        require(selection[offset + ranks] == 1, "non-finite logits");
+        const auto id = selection[offset + rank];
+        require(id >= 0 && id < vocab, "selected token outside vocabulary");
+        return id;
+    }
+    require(logits.size() % vocab == 0 && std::size_t(row) < logits.size() / vocab,
+            "invalid host selection row");
+    const auto* values = logits.data() + std::size_t(row) * vocab;
+    const int best = argmax(values, vocab);
+    if (rank == 0)
+        return best;
+    int second = best == 0 ? 1 : 0;
+    for (int index = 0; index < vocab; ++index)
+        if (index != best && values[index] > values[second])
+            second = index;
+    return second;
+}
+
+std::vector<std::int32_t> greedy_path(const std::vector<std::int32_t>& tokens,
+                                      const std::vector<std::int32_t>& parents,
+                                      const StepResult& result) {
+    require(result.vocab > 0 &&
+                (result.selection.empty()
+                     ? result.logits.size() == tokens.size() * result.vocab
+                     : result.ranks >= 1 && result.ranks <= 2 &&
+                           result.selection.size() == tokens.size() * (result.ranks + 1)),
+            "verification selection row mismatch");
+    return walk_greedy_path(tokens, parents, [&](int row) { return result.token(row); });
 }
 
 std::int32_t argmax(const float* values, int count) {
@@ -355,25 +509,10 @@ std::int32_t argmax(const float* values, int count) {
 std::vector<std::int32_t> greedy_path(const std::vector<std::int32_t>& tokens,
                                       const std::vector<std::int32_t>& parents,
                                       const std::vector<float>& logits, int vocab) {
-    require(!tokens.empty() && parents.size() == tokens.size() && parents[0] == -1 && vocab > 0 &&
-                logits.size() == tokens.size() * static_cast<std::size_t>(vocab),
+    require(vocab > 0 && logits.size() == tokens.size() * static_cast<std::size_t>(vocab),
             "invalid verification rows");
-    for (std::size_t row = 1; row < parents.size(); ++row)
-        require(parents[row] >= 0 && parents[row] < static_cast<int>(row), "invalid tree");
-    std::vector<std::int32_t> path{0};
-    for (;;) {
-        const auto parent = path.back();
-        const auto next = argmax(logits.data() + static_cast<std::size_t>(parent) * vocab, vocab);
-        auto found = tokens.size();
-        for (std::size_t row = parent + 1; row < tokens.size(); ++row) {
-            if (parents[row] == parent && tokens[row] == next) {
-                found = row;
-                break;
-            }
-        }
-        if (found == tokens.size())
-            return path;
-        path.push_back(static_cast<std::int32_t>(found));
-    }
+    return walk_greedy_path(tokens, parents, [&](int row) {
+        return argmax(logits.data() + std::size_t(row) * vocab, vocab);
+    });
 }
 } // namespace trtmc::llama::speculative

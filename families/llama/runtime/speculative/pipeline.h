@@ -23,6 +23,7 @@ class Pipeline final : public ITextGeneration {
   private:
     nlohmann::json manifest_;
     std::unique_ptr<Engine> target_, draft_;
+    DeviceTensor prompt_features_;
     std::shared_ptr<ITokenizer> tokenizer_;
     std::vector<std::int32_t> mapping_, eos_;
     std::vector<int> accepted_lengths_;

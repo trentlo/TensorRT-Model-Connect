@@ -18,6 +18,10 @@
 
 namespace trtmc::llama::speculative {
 namespace {
+void checked(cudaError_t status) {
+    if (status != cudaSuccess)
+        throw std::runtime_error(cudaGetErrorString(status));
+}
 std::vector<std::int32_t> chain(int rows) {
     std::vector<std::int32_t> parents(rows);
     std::iota(parents.begin(), parents.end(), -1);
@@ -74,18 +78,30 @@ Pipeline::Pipeline(const FamilyContext& context) {
         eos_ = manifest_.at("stop_token_ids").get<std::vector<std::int32_t>>();
     auto load = [&](const char* section, Contract contract, const std::string& label) {
         const auto plan = require_section(context.reader, section);
+        std::unique_ptr<ITrtModule> selection;
+        if (contract.device_selection) {
+            const auto selection_plan = require_section(
+                context.reader, contract.draft ? "draft_selection.plan" : "target_selection.plan");
+            selection =
+                load_engine(context.backend, selection_plan, (label + " selection").c_str());
+        }
         if (contract.profiles.empty())
             return std::make_unique<Engine>(load_engine(context.backend, plan, label.c_str()),
-                                            contract);
+                                            contract, nullptr, std::move(selection));
         auto dual = context.backend.create_dual_profile_modules(plan.data(), plan.size(), {});
         if (!dual.prefill || !dual.decode || !dual.prefill->ok() || !dual.decode->ok())
             throw std::runtime_error("could not create prefill/decode contexts for " + label);
         dual.prefill->set_timing_label(label + " prefill");
         dual.decode->set_timing_label(label + " decode");
-        return std::make_unique<Engine>(std::move(dual.decode), contract, std::move(dual.prefill));
+        return std::make_unique<Engine>(std::move(dual.decode), contract, std::move(dual.prefill),
+                                        std::move(selection));
     };
     target_ = load("target.plan", target, "llama target");
     draft_ = load("draft.plan", draft, "eagle3 draft");
+    prompt_features_ =
+        DeviceTensor({target.capacity, target.feature_width}, DType::kFloat16, target_->stream());
+    if (!prompt_features_.ok())
+        throw std::runtime_error("could not allocate prompt conditioning storage");
     tokenizer_ = create_tokenizer(context.reader);
     if (context.reader.find_section("chat_template.jinja"))
         template_format_ = llama_detect_chat_template_format(
@@ -132,18 +148,20 @@ TextResult Pipeline::generate_ids(const std::vector<std::int32_t>& prompt, int c
     draft_->reset();
     const auto prefill_start = std::chrono::steady_clock::now();
     StepResult target_result;
-    std::vector<std::uint16_t> prompt_features;
     for (int start = 0; start < static_cast<int>(prompt.size());) {
         const int rows =
             std::min(tc.query_limit(Phase::kPrefill), static_cast<int>(prompt.size()) - start);
         target_result = target_->run(Phase::kPrefill, slice(prompt, start, start + rows), start,
                                      chain(rows), false);
         if (speculative)
-            prompt_features.insert(prompt_features.end(), target_result.features.begin(),
-                                   target_result.features.end());
+            checked(cudaMemcpyAsync(static_cast<std::uint16_t*>(prompt_features_.data()) +
+                                        std::size_t(start) * tc.feature_width,
+                                    target_result.features.data,
+                                    std::size_t(rows) * tc.feature_width * 2,
+                                    cudaMemcpyDeviceToDevice, target_->stream()));
         start += rows;
     }
-    int root = argmax(target_result.logits.data(), tc.vocab);
+    int root = target_result.token();
     auto emit = [&](int token) {
         if (static_cast<int>(result.token_ids.size()) >= count)
             return false;
@@ -152,15 +170,22 @@ TextResult Pipeline::generate_ids(const std::vector<std::int32_t>& prompt, int c
                (ignore_eos || std::find(eos_.begin(), eos_.end(), token) == eos_.end());
     };
     bool more = emit(root);
-    if (speculative && more)
-        method.prefill(prompt, root, prompt_features);
+    if (speculative) {
+        // Prompt accumulation follows each target call on its own stream.
+        // Complete it before a potentially different draft stream reads it.
+        checked(cudaStreamSynchronize(target_->stream()));
+        if (more)
+            method.prefill(prompt, root,
+                           {static_cast<const std::uint16_t*>(prompt_features_.data()),
+                            static_cast<int>(prompt.size()), tc.feature_width});
+    }
     result.prefill_ms = elapsed(prefill_start);
     const auto decode_start = std::chrono::steady_clock::now();
     int committed = static_cast<int>(prompt.size());
     while (more) {
         if (!speculative) {
             target_result = target_->run(Phase::kDecode, {root}, committed++, {-1}, false);
-            root = argmax(target_result.logits.data(), tc.vocab);
+            root = target_result.token();
             more = emit(root);
             continue;
         }
@@ -168,16 +193,13 @@ TextResult Pipeline::generate_ids(const std::vector<std::int32_t>& prompt, int c
             method.propose(root, committed, count - static_cast<int>(result.token_ids.size()));
         target_result =
             target_->run(Phase::kDecode, proposal.tokens, committed, proposal.parents, true);
-        const auto path =
-            greedy_path(proposal.tokens, proposal.parents, target_result.logits, tc.vocab);
+        const auto path = greedy_path(proposal.tokens, proposal.parents, target_result);
         accepted_lengths_.push_back(static_cast<int>(path.size()) - 1);
         if (draft_width > 1)
             target_->commit(committed, path);
         for (std::size_t index = 1; index < path.size() && more; ++index)
             more = emit(proposal.tokens[path[index]]);
-        root =
-            argmax(target_result.logits.data() + static_cast<std::size_t>(path.back()) * tc.vocab,
-                   tc.vocab);
+        root = target_result.token(path.back());
         if (more)
             more = emit(root);
         if (!more)

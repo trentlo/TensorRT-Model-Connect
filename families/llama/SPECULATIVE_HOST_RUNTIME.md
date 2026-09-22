@@ -54,9 +54,12 @@ Pageable `cudaMemcpyAsync` calls also block while preceding GPU work completes.
 Their CPU API duration therefore includes GPU execution; it must not be counted
 again as transfer overhead or added to the GPU-idle measurements.
 
-## Proposed next scope: device-resident features and greedy selection
+## Follow-up scope: device-resident features and greedy selection
 
-These changes are not implemented by the allocation fix.
+These changes were not implemented by the allocation fix measured in this note.
+The subsequent [resident runtime](SPECULATIVE_RESIDENT_RUNTIME.md) implements
+device feature transport, an optional TensorRT selector and reusable buffers.
+CUDA graph replay remains future work. The original plan was:
 
 1. Keep target and recurrent draft features on the GPU. Replace host feature
    vectors in the family runtime's step result with device storage/views and

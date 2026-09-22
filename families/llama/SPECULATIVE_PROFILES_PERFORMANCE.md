@@ -15,6 +15,10 @@ for profile bounds and state ownership. The default remains `single`.
 
 ## Measured request latency
 
+The follow-up [graph and runtime profile](SPECULATIVE_GRAPH_PROFILE.md) separates
+GPU execution from host overhead and confirms the largest remaining CPU cost
+with a controlled diagnostic.
+
 Medians of ten timed requests, including target and draft prefill. Throughput
 is all 101 generated tokens divided by complete request time.
 

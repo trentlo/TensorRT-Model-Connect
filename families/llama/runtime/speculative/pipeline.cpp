@@ -57,7 +57,8 @@ Pipeline::Pipeline(const FamilyContext& context) {
         target.feature_width != draft.feature_width || target.hidden != draft.hidden)
         throw std::invalid_argument("incompatible target/draft contracts");
     depth_ = manifest_.at("draft_depth");
-    if (depth_ < 1 || depth_ >= target.max_query || depth_ >= draft.max_query)
+    if (depth_ < 1 || depth_ >= target.query_limit(Phase::kDecode) ||
+        depth_ >= draft.query_limit(Phase::kDecode))
         throw std::invalid_argument("draft depth exceeds compiled query profile");
     mapping_ = manifest_.at("d2t").get<std::vector<std::int32_t>>();
     if (mapping_.size() != static_cast<std::size_t>(draft.vocab))
@@ -71,13 +72,20 @@ Pipeline::Pipeline(const FamilyContext& context) {
                            : std::vector<std::int32_t>{stop.get<std::int32_t>()};
     if (manifest_.contains("stop_token_ids"))
         eos_ = manifest_.at("stop_token_ids").get<std::vector<std::int32_t>>();
-    target_ = std::make_unique<Engine>(load_engine(context.backend,
-                                                   require_section(context.reader, "target.plan"),
-                                                   "llama target"),
-                                       target);
-    draft_ = std::make_unique<Engine>(
-        load_engine(context.backend, require_section(context.reader, "draft.plan"), "eagle3 draft"),
-        draft);
+    auto load = [&](const char* section, Contract contract, const std::string& label) {
+        const auto plan = require_section(context.reader, section);
+        if (contract.profiles.empty())
+            return std::make_unique<Engine>(load_engine(context.backend, plan, label.c_str()),
+                                            contract);
+        auto dual = context.backend.create_dual_profile_modules(plan.data(), plan.size(), {});
+        if (!dual.prefill || !dual.decode || !dual.prefill->ok() || !dual.decode->ok())
+            throw std::runtime_error("could not create prefill/decode contexts for " + label);
+        dual.prefill->set_timing_label(label + " prefill");
+        dual.decode->set_timing_label(label + " decode");
+        return std::make_unique<Engine>(std::move(dual.decode), contract, std::move(dual.prefill));
+    };
+    target_ = load("target.plan", target, "llama target");
+    draft_ = load("draft.plan", draft, "eagle3 draft");
     tokenizer_ = create_tokenizer(context.reader);
     if (context.reader.find_section("chat_template.jinja"))
         template_format_ = llama_detect_chat_template_format(
@@ -105,7 +113,8 @@ TextResult Pipeline::generate_ids(const std::vector<std::int32_t>& prompt, int c
                                   bool speculative, bool ignore_eos, int draft_width) {
     const auto& tc = target_->contract();
     Eagle3 method(*draft_, mapping_, depth_, draft_width);
-    if (draft_width < 1 || draft_width > 2 || depth_ * draft_width + 1 > tc.max_query)
+    if (draft_width < 1 || draft_width > 2 ||
+        depth_ * draft_width + 1 > tc.query_limit(Phase::kDecode))
         throw std::invalid_argument(
             "prototype supports a chain or a two-child tree within the query profile");
     if (prompt.empty() || count < 0 || prompt.size() > static_cast<std::size_t>(tc.capacity) ||
@@ -125,8 +134,10 @@ TextResult Pipeline::generate_ids(const std::vector<std::int32_t>& prompt, int c
     StepResult target_result;
     std::vector<std::uint16_t> prompt_features;
     for (int start = 0; start < static_cast<int>(prompt.size());) {
-        const int rows = std::min(tc.max_query, static_cast<int>(prompt.size()) - start);
-        target_result = target_->run(slice(prompt, start, start + rows), start, chain(rows), false);
+        const int rows =
+            std::min(tc.query_limit(Phase::kPrefill), static_cast<int>(prompt.size()) - start);
+        target_result = target_->run(Phase::kPrefill, slice(prompt, start, start + rows), start,
+                                     chain(rows), false);
         if (speculative)
             prompt_features.insert(prompt_features.end(), target_result.features.begin(),
                                    target_result.features.end());
@@ -148,14 +159,15 @@ TextResult Pipeline::generate_ids(const std::vector<std::int32_t>& prompt, int c
     int committed = static_cast<int>(prompt.size());
     while (more) {
         if (!speculative) {
-            target_result = target_->run({root}, committed++, {-1}, false);
+            target_result = target_->run(Phase::kDecode, {root}, committed++, {-1}, false);
             root = argmax(target_result.logits.data(), tc.vocab);
             more = emit(root);
             continue;
         }
         const auto proposal =
             method.propose(root, committed, count - static_cast<int>(result.token_ids.size()));
-        target_result = target_->run(proposal.tokens, committed, proposal.parents, true);
+        target_result =
+            target_->run(Phase::kDecode, proposal.tokens, committed, proposal.parents, true);
         const auto path =
             greedy_path(proposal.tokens, proposal.parents, target_result.logits, tc.vocab);
         accepted_lengths_.push_back(static_cast<int>(path.size()) - 1);

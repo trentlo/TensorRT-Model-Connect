@@ -81,11 +81,54 @@ copies the supplied host inputs. Tensor names are part of the ABI.
 | `draft_features` (draft) | input FP16 `[Q,4096]` | Previous draft residual features, or zero when using target features. |
 | `features` (draft) | output FP16 `[Q,4096]` | Unnormalized draft residual stream, in query-row order. |
 
-Both engines have one optimization profile, `1 <= M <= Q <= max_query`.
-Prefill is chunked at `max_query` (64 by default). A prefill call selects only
-its last logits row while returning all feature rows. Verification selects
-every candidate row. The runtime enforces `s >= 0` and `s+Q <= C`.
+By default both engines retain one optimization profile, with query and selected
+logit row MIN/OPT/MAX bounds `1/16/64` (OPT is capped by `max_query`). Prefill is
+chunked at `max_query`, 64 by default. A prefill call selects only its last logits
+row while returning all feature rows. Verification selects every candidate row.
+The runtime enforces `1 <= M <= Q`, `s >= 0` and `s+Q <= C`.
 The two conditioning inputs must have the same `Q` as the draft's token input.
+
+### Separate prefill and decode profiles
+
+Build with `--execution-profiles split --prefill-query P` to specialize each
+engine for both phases. With draft depth four, the shape contract is:
+
+| Engine/profile | Query MIN/OPT/MAX | Selected logits MIN/OPT/MAX |
+|---|---|---|
+| Target 0: prefill | `1/P/P` | `1/1/1` |
+| Target 1: decode/verify | `1/5/9` | `1/5/9` |
+| Draft 0: prefill | `1/P/P` | `1/1/1` |
+| Draft 1: propose/feedback | `1/1/5` | `1/1/1` |
+
+Target decode is optimized for a four-candidate chain; its maximum also admits
+the width-two, depth-four tree. Draft proposal consumes one row, while accepted
+target-feature feedback can consume up to five rows. `P=64` preserves chunking;
+`P=1024` allows one target and one draft prefill invocation for an IST=1024
+request. Short prompts and final partial chunks use profile 0 even for one row.
+`--max-query` remains the legacy profile bound and a speculative-depth safety
+cap; split profile bounds are derived from `--prefill-query` and `--draft-depth`.
+
+The optional `execution_profiles` array in each engine's `speculative.json`
+contract records `phase`, `query` and `logits` MIN/OPT/MAX triplets in profile
+index order. `max_query` is the largest query maximum across those profiles.
+Missing or empty arrays select the legacy single-profile runtime. This is
+additive execution metadata: native state ABI v1 and plugin state ABI v2 retain
+their existing tensor semantics, storage layouts and alias requirements.
+Split bundles require the updated runtime; existing single-profile bundles
+remain readable.
+
+The runtime selects the profile from an explicit `Phase`, validates every
+dynamic input's MIN/OPT/MAX against the serialized engine, and checks invocation
+row counts before enqueue. Each engine is deserialized once into two persistent
+execution contexts sharing its weights, CUDA stream and runtime-owned KV
+allocations. Context workspaces and ordinary input/output buffers are separate.
+Both contexts bind the same KV addresses and validate the alias contract.
+Prefill-to-decode transitions preserve state without copying or resetting KV.
+Request reset resets logical lengths and invokes both modules' reset hooks;
+the backend preserves the existing contexts and bindings. Target and draft still
+own separate states and streams. Host synchronization preserves their existing
+ordering. Profile selection changes neither commit/rollback nor EAGLE3 feature
+alignment, and works with both attention lowerings.
 
 The compiler encodes KV reads, writes and aliases in the graph. The sidecar
 describes that graph contract; it is not a replacement for compiler-visible

@@ -41,7 +41,7 @@ plugin library. Ordinary model operations, including projections, norms,
 RoPE, MLPs, feature concatenation, logits and mask composition, remain graph ops.
 
 With plugins enabled, `TRTMC_LLAMA_EDGE_XQA=ON` (the default) compiles the
-extracted XQA kernel for FP16, head dimension 128, page size 64 and at most 64
+extracted XQA kernel for FP16, head dimension 128, page size 64 and at most 1024
 query rows. Its aligned tensor-core path covers chunked prefill, ordinary
 decode, chain and tree verification. Other geometries or unaligned buffers
 use the scalar implementation. Set `TRTMC_LLAMA_EDGE_XQA=OFF` to build the

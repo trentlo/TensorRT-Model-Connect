@@ -53,14 +53,84 @@ Contract Contract::parse(const nlohmann::json& value) {
                     c.dim <= 256,
                 "unsupported plugin page geometry");
     }
+    if (value.contains("execution_profiles"))
+        require(value.at("execution_profiles").is_array(), "execution profiles must be an array");
+    if (value.contains("execution_profiles") && !value.at("execution_profiles").empty()) {
+        const auto& profiles = value.at("execution_profiles");
+        require(profiles.size() == 2, "expected prefill/decode profiles");
+        for (int i = 0; i < 2; ++i) {
+            require(profiles[i].at("phase") == (i == 0 ? "prefill" : "decode"),
+                    "execution profile phase order mismatch");
+            for (const auto* name : {"query", "logits"}) {
+                const auto& bounds = profiles[i].at(name);
+                require(bounds.is_array() && bounds.size() == 3,
+                        "expected MIN/OPT/MAX profile bounds");
+                for (const auto& bound : bounds)
+                    require(bound.is_number_integer(), "profile bounds must be integers");
+            }
+            ExecutionProfile p{profiles[i].at("query").get<std::array<int, 3>>(),
+                               profiles[i].at("logits").get<std::array<int, 3>>()};
+            for (const auto& bounds : {p.query, p.logits})
+                require(bounds[0] == 1 && bounds[1] >= 1 && bounds[1] <= bounds[2] &&
+                            bounds[2] <= c.max_query,
+                        "invalid execution profile bounds");
+            for (int j = 0; j < 3; ++j)
+                require(p.logits[j] <= p.query[j], "selected rows exceed query profile");
+            if (i == 0 || c.draft)
+                require(p.logits == std::array<int, 3>{1, 1, 1},
+                        "prefill/draft must select one logit row");
+            c.profiles.push_back(p);
+        }
+        require(std::max(c.profiles[0].query[2], c.profiles[1].query[2]) == c.max_query,
+                "manifest query bound does not match profiles");
+    }
     return c;
 }
 
-Engine::Engine(std::unique_ptr<ITrtModule> module, Contract contract)
-    : module_(std::move(module)), contract_(contract),
+Engine::Engine(std::unique_ptr<ITrtModule> module, Contract contract,
+               std::unique_ptr<ITrtModule> prefill)
+    : module_(std::move(module)), prefill_(std::move(prefill)), contract_(contract),
       layout_(contract.capacity, contract.page_size) {
     require(module_ && module_->ok(), "invalid execution module");
     const auto& c = contract_;
+    require(c.profiles.empty() == (prefill_ == nullptr), "execution module/profile mismatch");
+    if (prefill_)
+        require(prefill_->ok() && prefill_->profile_idx() == 0 && module_->profile_idx() == 1 &&
+                    prefill_->stream() == module_->stream(),
+                "prefill/decode must use matching contexts on one stream");
+    // Validate both contexts against the compiler's complete row contract.
+    for (const auto* module : {module_.get(), prefill_.get()}) {
+        if (!module)
+            continue;
+        const int profile = module->profile_idx();
+        require(module->optimization_profile_count() == (c.profiles.empty() ? 1 : 2),
+                "unexpected optimization profile count");
+        const ExecutionProfile bounds =
+            c.profiles.empty() ? ExecutionProfile{{1, std::min(16, c.max_query), c.max_query},
+                                                  {1, std::min(16, c.max_query), c.max_query}}
+                               : c.profiles.at(profile);
+        auto check_rows = [&](const char* name, std::vector<std::int64_t> shape, int axis,
+                              const std::array<int, 3>& rows) {
+            constexpr ProfileShapeSelector selectors[]{
+                ProfileShapeSelector::kMin, ProfileShapeSelector::kOpt, ProfileShapeSelector::kMax};
+            for (int i = 0; i < 3; ++i) {
+                shape[axis] = rows[i];
+                require(module->input_profile_shape(name, profile, selectors[i]) == shape,
+                        std::string("profile mismatch: ") + name);
+            }
+        };
+        for (const auto* name : {"token_id", "position_id"})
+            check_rows(name, {0}, 0, bounds.query);
+        check_rows("logits_indices", {0}, 0, bounds.logits);
+        check_rows("attention_mask", {0, c.capacity}, 0, bounds.query);
+        if (c.page_size)
+            for (const auto* name : {"key_write_slots", "value_write_slots"})
+                check_rows(name, {1, 0}, 1, bounds.query);
+        if (c.draft) {
+            check_rows("target_features", {0, c.feature_width}, 0, bounds.query);
+            check_rows("draft_features", {0, c.hidden}, 0, bounds.query);
+        }
+    }
     for (const auto* name :
          {"token_id", "position_id", "logits_indices", "attention_mask", "key_value_lengths"}) {
         require(module_->has_input(name) && module_->tensor_dtype(name) == DType::kInt32,
@@ -70,25 +140,12 @@ Engine::Engine(std::unique_ptr<ITrtModule> module, Contract contract)
             "missing FP32 logits");
     require(module_->has_output("features") && module_->tensor_dtype("features") == DType::kFloat16,
             "missing FP16 features");
-    require(module_->optimization_profile_count() == 1, "expected one query profile");
-    for (const auto* name : {"token_id", "position_id", "logits_indices"}) {
-        require(module_->input_profile_shape(name, 0, ProfileShapeSelector::kMin) ==
-                        std::vector<std::int64_t>{1} &&
-                    module_->input_profile_shape(name, 0, ProfileShapeSelector::kMax) ==
-                        std::vector<std::int64_t>{c.max_query},
-                std::string("query profile mismatch: ") + name);
-    }
-    require(module_->input_profile_shape("attention_mask", 0, ProfileShapeSelector::kMax) ==
-                std::vector<std::int64_t>({c.max_query, c.capacity}),
-            "visibility profile mismatch");
     for (const auto* name : {"key_value_lengths"})
         require(module_->tensor_shape(name) == std::vector<std::int64_t>{1},
                 "invalid state scalar shape");
     if (c.page_size) {
         for (const auto* name : {"key_write_slots", "value_write_slots"})
-            require(module_->has_input(name) && module_->tensor_dtype(name) == DType::kInt32 &&
-                        module_->input_profile_shape(name, 0, ProfileShapeSelector::kMax) ==
-                            std::vector<std::int64_t>({1, c.max_query}),
+            require(module_->has_input(name) && module_->tensor_dtype(name) == DType::kInt32,
                     "invalid indexed slot input");
         for (const auto* name : {"key_pages", "value_pages"})
             require(module_->has_input(name) && module_->tensor_dtype(name) == DType::kInt32 &&
@@ -109,10 +166,7 @@ Engine::Engine(std::unique_ptr<ITrtModule> module, Contract contract)
     }
     if (c.draft) {
         for (const auto* name : {"target_features", "draft_features"}) {
-            const int width = name[0] == 't' ? c.feature_width : c.hidden;
-            require(module_->has_input(name) && module_->tensor_dtype(name) == DType::kFloat16 &&
-                        module_->input_profile_shape(name, 0, ProfileShapeSelector::kMax) ==
-                            std::vector<std::int64_t>({c.max_query, width}),
+            require(module_->has_input(name) && module_->tensor_dtype(name) == DType::kFloat16,
                     std::string("conditioning contract mismatch: ") + name);
         }
     }
@@ -134,6 +188,8 @@ Engine::Engine(std::unique_ptr<ITrtModule> module, Contract contract)
             auto& tensor = kind[0] == 'k' ? keys_.back() : values_.back();
             require(tensor.ok(), "KV allocation failed");
             module_->bind_external(input, tensor.data());
+            if (prefill_)
+                prefill_->bind_external(input, tensor.data());
             if (c.page_size) {
 #ifdef TRTMC_LLAMA_ATTENTION_STATE_PLUGINS
                 auto registration =
@@ -146,6 +202,8 @@ Engine::Engine(std::unique_ptr<ITrtModule> module, Contract contract)
                 // compiler-inserted cache copies; this is explicitly a weaker
                 // build-time guarantee than future requireOutputAlias support.
                 module_->bind_external(output, tensor.data());
+                if (prefill_)
+                    prefill_->bind_external(output, tensor.data());
 #else
                 throw std::runtime_error("rebuild with TRTMC_LLAMA_ATTENTION_STATE_PLUGINS=ON");
 #endif
@@ -155,18 +213,21 @@ Engine::Engine(std::unique_ptr<ITrtModule> module, Contract contract)
             // at enqueue; equal external bindings alone are insufficient.
             require(module_->device_ptr(output) == tensor.data(),
                     "required cache allocation binding is missing: " + output);
+            if (prefill_)
+                require(prefill_->device_ptr(output) == tensor.data(),
+                        "prefill cache allocation binding is missing: " + output);
         }
     }
     module_->sync();
 }
 
-StepResult Engine::run(const std::vector<std::int32_t>& tokens, int start,
+StepResult Engine::run(Phase phase, const std::vector<std::int32_t>& tokens, int start,
                        const std::vector<std::int32_t>& parents, bool all_logits,
                        const std::vector<std::uint16_t>& target_features,
                        const std::vector<std::uint16_t>& draft_features) {
     const auto& c = contract_;
     const int rows = static_cast<int>(tokens.size());
-    require(rows > 0 && rows <= c.max_query && start >= 0 && start <= c.capacity - rows,
+    require(rows > 0 && rows <= c.query_limit(phase) && start >= 0 && start <= c.capacity - rows,
             "query exceeds engine profile or cache bounds");
     require(parents.size() == tokens.size(), "parent count mismatch");
     std::vector<std::int32_t> positions(rows), mask(static_cast<std::size_t>(rows) * c.capacity, 0);
@@ -221,17 +282,24 @@ StepResult Engine::run(const std::vector<std::int32_t>& tokens, int start,
         inputs["draft_features"] = {
             const_cast<std::uint16_t*>(draft_features.data()), {rows, c.hidden}, DType::kFloat16};
     }
-    module_->forward_async(inputs);
+    auto& module = phase == Phase::kPrefill && prefill_ ? prefill_ : module_;
+    if (!c.profiles.empty()) {
+        const auto& bounds = c.profiles[phase == Phase::kPrefill ? 0 : 1].logits;
+        require(selected.size() >= std::size_t(bounds[0]) &&
+                    selected.size() <= std::size_t(bounds[2]),
+                "selected logits exceed phase profile");
+    }
+    module->forward_async(inputs);
     StepResult result;
     result.logits.resize(selected.size() * c.vocab);
     result.features.resize(static_cast<std::size_t>(rows) * (c.draft ? c.hidden : c.feature_width));
-    checked(cudaMemcpyAsync(result.logits.data(), module_->device_ptr("logits"),
+    checked(cudaMemcpyAsync(result.logits.data(), module->device_ptr("logits"),
                             result.logits.size() * sizeof(float), cudaMemcpyDeviceToHost,
-                            module_->stream()));
-    checked(cudaMemcpyAsync(result.features.data(), module_->device_ptr("features"),
+                            module->stream()));
+    checked(cudaMemcpyAsync(result.features.data(), module->device_ptr("features"),
                             result.features.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost,
-                            module_->stream()));
-    module_->sync();
+                            module->stream()));
+    module->sync();
     return result;
 }
 
@@ -271,6 +339,8 @@ void Engine::commit(int start, const std::vector<std::int32_t>& rows) {
 void Engine::reset() {
     // No byte clearing: subsequent inputs expose only the current valid prefix.
     module_->reset_execution_context();
+    if (prefill_)
+        prefill_->reset_execution_context();
 }
 
 std::int32_t argmax(const float* values, int count) {

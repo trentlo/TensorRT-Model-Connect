@@ -30,7 +30,8 @@ class Graph:
         self.build_config = self.builder.create_builder_config()
         self.build_config.builder_optimization_level = 1
         self.build_config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 16 << 30)
-        self.profile = self.builder.create_optimization_profile()
+        self.profiles = [self.builder.create_optimization_profile()
+                         for _ in range(len(contract.execution_profiles) or 1)]
         self.tokens = self.input("token_id", trt.int32, (-1,))
         self.positions = self.input("position_id", trt.int32, (-1,))
         self.selected = self.input("logits_indices", trt.int32, (-1,))
@@ -75,10 +76,8 @@ class Graph:
     def input(self, name, dtype, shape):
         value = self.network.add_input(name, dtype, shape)
         if -1 in shape:
-            minimum = tuple(1 if x == -1 else x for x in shape)
-            optimum = tuple(min(16, self.contract.max_query) if x == -1 else x for x in shape)
-            maximum = tuple(self.contract.max_query if x == -1 else x for x in shape)
-            self.profile.set_shape(name, minimum, optimum, maximum)
+            for profile, bounds in zip(self.profiles, self.contract.profile_shapes(name, shape)):
+                profile.set_shape(name, *bounds)
         return value
 
     def constant(self, value):
@@ -178,7 +177,8 @@ class Graph:
     def finish(self):
         if self.state_graph:
             self.state_graph.validate_effects()
-        self.build_config.add_optimization_profile(self.profile)
+        for profile in self.profiles:
+            self.build_config.add_optimization_profile(profile)
         result = self.builder.build_serialized_network(self.network, self.build_config)
         if result is None:
             raise RuntimeError(f"failed to compile speculative {self.contract.role} engine")

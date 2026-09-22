@@ -11,6 +11,45 @@
 int main() {
     using trtmc::llama::speculative::greedy_path;
     try {
+        using trtmc::llama::speculative::Contract;
+        using trtmc::llama::speculative::Phase;
+        auto manifest = nlohmann::json::parse(R"({
+          "version":1,"role":"target","precision":"fp16",
+          "cache_layout":"batch_heads_capacity_dim","cache_update":"aliased_contiguous_append",
+          "layers":32,"hidden_size":4096,"kv_heads":8,"head_dim":128,"vocab_size":128256,
+          "capacity":2048,"max_query":1024,"feature_width":12288,
+          "execution_profiles":[
+            {"phase":"prefill","query":[1,1024,1024],"logits":[1,1,1]},
+            {"phase":"decode","query":[1,5,9],"logits":[1,5,9]}]})");
+        auto contract = Contract::parse(manifest);
+        if (contract.query_limit(Phase::kPrefill) != 1024 ||
+            contract.query_limit(Phase::kDecode) != 9)
+            throw std::runtime_error("phase query limits are not independent");
+        manifest["execution_profiles"][0]["phase"] = "decode";
+        bool bad_profile = false;
+        try {
+            Contract::parse(manifest);
+        } catch (const std::invalid_argument&) {
+            bad_profile = true;
+        }
+        if (!bad_profile)
+            throw std::runtime_error("accepted swapped execution profiles");
+        manifest["execution_profiles"][0]["phase"] = "prefill";
+        manifest["execution_profiles"][1]["query"] = {1, 5, 9, 64};
+        bad_profile = false;
+        try {
+            Contract::parse(manifest);
+        } catch (const std::invalid_argument&) {
+            bad_profile = true;
+        }
+        if (!bad_profile)
+            throw std::runtime_error("accepted malformed profile bounds");
+        manifest.erase("execution_profiles");
+        manifest["max_query"] = 64;
+        contract = Contract::parse(manifest);
+        if (contract.query_limit(Phase::kPrefill) != 64 ||
+            contract.query_limit(Phase::kDecode) != 64)
+            throw std::runtime_error("legacy single-profile contract changed");
         trtmc::llama::speculative::StateLayout layout(16, 4);
         if (layout.slot(3, true) != 15 || layout.slot(4, true) != 8 || layout.slot(4, false) != 4 ||
             layout.offset(4, true, 2, 8) != 128 || layout.head_stride() != 4)

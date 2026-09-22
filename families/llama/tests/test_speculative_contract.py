@@ -4,7 +4,7 @@
 import pytest
 from dataclasses import replace
 
-from ..speculative.contract import EngineContract, tree_visibility
+from ..speculative.contract import EngineContract, ExecutionProfile, tree_visibility
 
 
 def test_siblings_are_hidden_and_ancestors_visible():
@@ -40,3 +40,28 @@ def test_paged_contract_is_explicit_and_rejects_incompatible_geometry():
                     {"version": 1}, {"attention_backend": "primitives"}):
         with pytest.raises(ValueError):
             replace(contract, **changes)
+
+
+def test_phase_profiles_separate_query_and_selected_rows():
+    profiles = (ExecutionProfile("prefill", (1, 1024, 1024), (1, 1, 1)),
+                ExecutionProfile("decode", (1, 5, 9), (1, 5, 9)))
+    contract = EngineContract("target", 32, 4096, 8, 128, 128256, 2048,
+                              max_query=1024, feature_width=12288, execution_profiles=profiles)
+    assert contract.profile_shapes("attention_mask", (-1, 2048)) == [
+        ((1, 2048), (1024, 2048), (1024, 2048)), ((1, 2048), (5, 2048), (9, 2048))]
+    assert contract.profile_shapes("logits_indices", (-1,)) == [
+        ((1,), (1,), (1,)), ((1,), (5,), (9,))]
+    assert contract.profile_shapes("key_write_slots", (1, -1))[1] == ((1, 1), (1, 5), (1, 9))
+    for changes in ({"execution_profiles": profiles[::-1]}, {"max_query": 2048},
+                    {"role": "draft"}, {"execution_profiles": profiles[:1]}):
+        with pytest.raises(ValueError):
+            replace(contract, **changes)
+    legacy = replace(contract, execution_profiles=(), max_query=64)
+    assert legacy.profile_shapes("logits_indices", (-1,)) == [((1,), (16,), (64,))]
+
+
+@pytest.mark.parametrize("query,logits", [((0, 5, 9), (1, 1, 1)), ((1, 9, 5), (1, 1, 1)),
+                                         ((1, 5, 9), (1, 6, 9)), ((1, 5, 9), (1, 5, 10))])
+def test_invalid_profile_bounds(query, logits):
+    with pytest.raises(ValueError):
+        ExecutionProfile("decode", query, logits)

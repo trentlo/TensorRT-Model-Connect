@@ -14,7 +14,7 @@ from tensorrt_model_connect.bundle_writer import BundleWriter
 from ..checkpoint_mapper import load_standard_weights
 from ..config import ModelConfig
 from ..model import _BUNDLE_FILES, _chat_template, _runtime_config
-from .contract import EngineContract
+from .contract import EngineContract, ExecutionProfile
 
 
 def load_draft(path: Path, embedding: np.ndarray):
@@ -65,7 +65,8 @@ def build_speculative(*, model_dir: Path, draft_dir: Path, output: Path,
                       max_sequence_length: int = 2048, max_query: int = 64,
                       draft_depth: int = 4, spec_dec: str = "eagle3", verbose: bool = False,
                       attention_backend: str = "primitives", kv_page_size: int = 64,
-                      attention_plugin_library: Path | None = None) -> int:
+                      attention_plugin_library: Path | None = None,
+                      execution_profiles: str = "single", prefill_query: int = 64) -> int:
     from .graph import build_draft, build_target
 
     if spec_dec != "eagle3":
@@ -90,10 +91,23 @@ def build_speculative(*, model_dir: Path, draft_dir: Path, output: Path,
         raise ValueError("require draft_depth >= 1 and 2 * draft_depth + 1 <= max_query <= 64")
     if max_sequence_length > config.max_position_embeddings:
         raise ValueError("capacity exceeds target context window")
+    if execution_profiles not in {"single", "split"}:
+        raise ValueError("execution_profiles must be single or split")
+    target_profiles, draft_profiles = (), ()
+    target_max, draft_max = max_query, max_query
+    if execution_profiles == "split":
+        if not 1 <= prefill_query <= max_sequence_length:
+            raise ValueError("prefill_query exceeds cache capacity")
+        prefill = ExecutionProfile("prefill", (1, prefill_query, prefill_query), (1, 1, 1))
+        verify = (1, draft_depth + 1, 2 * draft_depth + 1)
+        target_profiles = (prefill, ExecutionProfile("decode", verify, verify))
+        draft_profiles = (prefill, ExecutionProfile("decode", (1, 1, draft_depth + 1), (1, 1, 1)))
+        target_max = max(prefill_query, verify[2])
+        draft_max = max(prefill_query, draft_depth + 1)
     target_contract = EngineContract(
         "target", config.num_hidden_layers, config.hidden_size, config.num_key_value_heads,
-        config.head_dim, config.vocab_size, max_sequence_length, max_query, 3 * config.hidden_size,
-        **state,
+        config.head_dim, config.vocab_size, max_sequence_length, target_max, 3 * config.hidden_size,
+        execution_profiles=target_profiles, **state,
     )
     weights = load_standard_weights(model_dir, config, precision="fp16")
     draft_config, draft_weights, mapping = load_draft(draft_dir, weights["embedding"])
@@ -102,8 +116,8 @@ def build_speculative(*, model_dir: Path, draft_dir: Path, output: Path,
     draft_contract = EngineContract(
         "draft", draft_config.num_hidden_layers, draft_config.hidden_size,
         draft_config.num_key_value_heads, draft_config.head_dim, len(mapping),
-        max_sequence_length, max_query, 3 * config.hidden_size,
-        **state,
+        max_sequence_length, draft_max, 3 * config.hidden_size,
+        execution_profiles=draft_profiles, **state,
     )
     writer = BundleWriter(output)
     runtime_metadata = _runtime_config(model_dir, config)

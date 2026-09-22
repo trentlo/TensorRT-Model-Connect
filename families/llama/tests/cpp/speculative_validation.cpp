@@ -5,6 +5,7 @@
 #include "families/llama/runtime/speculative/pipeline.h"
 #include "trtmc/runtime/trt_backend.h"
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -48,6 +49,15 @@ int main(int argc, char** argv) {
                            vanilla.token_ids == eagle.token_ids &&
                            vanilla.token_ids == chain.token_ids;
         const bool reset_equal = vanilla.token_ids == repeated.token_ids;
+        // A 65-row prompt covers a short final chunk with the 64-row prefill
+        // profile; a one-row prompt must still select the prefill context.
+        bool short_prompt_equal = true;
+        for (const std::size_t length : {std::size_t(1), std::min(ids.size(), std::size_t(65))}) {
+            const std::vector<std::int32_t> short_ids(ids.begin(), ids.begin() + length);
+            const auto short_ar = pipeline.generate_ids(short_ids, 8, false, true);
+            const auto short_spec = pipeline.generate_ids(short_ids, 8, true, true, 1);
+            short_prompt_equal &= short_ar.token_ids == short_spec.token_ids;
+        }
         nlohmann::json result{
             {"input_tokens", ids.size()},
             {"requested_output_tokens", count},
@@ -57,6 +67,7 @@ int main(int argc, char** argv) {
             {"chain_accepted_lengths", chain_accepted},
             {"tokens_equal", equal},
             {"reset_equal", reset_equal},
+            {"short_prompt_equal", short_prompt_equal},
             {"accepted_lengths", accepted},
             {"verification_rounds", accepted.size()},
             {"autoregressive_prefill_ms", vanilla.prefill_ms},
@@ -73,7 +84,7 @@ int main(int argc, char** argv) {
         output << result.dump(2) << '\n';
         std::cout << "tokens_equal=" << equal << " reset_equal=" << reset_equal
                   << " verification_rounds=" << accepted.size() << '\n';
-        return equal && reset_equal ? 0 : 1;
+        return equal && reset_equal && short_prompt_equal ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

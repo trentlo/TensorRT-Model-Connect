@@ -127,7 +127,7 @@ cudaError_t attention(const void* query, const void* keys, const void* values, c
     const auto addresses =
         reinterpret_cast<std::uintptr_t>(query) | reinterpret_cast<std::uintptr_t>(keys) |
         reinterpret_cast<std::uintptr_t>(values) | reinterpret_cast<std::uintptr_t>(output);
-    if (dim == 128 && page_size == 64 && queries <= 64 && addresses % 16 == 0)
+    if (dim == 128 && page_size == 64 && queries <= 1024 && addresses % 16 == 0)
         return xqa_attention(query, keys, values, key_pages, value_pages, lengths, mask, output,
                              batch, heads, kv_heads, queries, key_count, value_count, logical_pages,
                              mask_heads, stream);

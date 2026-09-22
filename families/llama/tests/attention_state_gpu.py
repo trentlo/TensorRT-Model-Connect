@@ -48,6 +48,24 @@ def reference(query, keys, values, kp, vp, lengths, mask, slots_k, slots_v, new_
 
 def xqa_arrays(case, random, rng):
     """Exercise the demanded XQA geometry with independent pool maps and full masks."""
+    if case == "prefill1024":
+        queries, capacity = 1024, 1088
+        arrays = {
+            "q": random((1, 4, queries, 128)),
+            "k": random((17, 1, 64, 128)), "v": random((17, 1, 64, 128)),
+            "new_k": random((1, 1, queries, 128)), "new_v": random((1, 1, queries, 128)),
+            "ks": np.full((1, queries), -1, np.int32),
+            "vs": np.full((1, queries), -1, np.int32),
+            "kp": np.array([list(reversed(range(16))) + [-1]], np.int32),
+            "vp": np.array([list(range(16)) + [-1]], np.int32),
+            "length": np.array([queries], np.int32),
+            "mask": (np.arange(capacity)[None, None, None, :] <=
+                     np.arange(queries)[None, None, :, None]),
+        }
+        arrays["mask"][:, :, -1] = False
+        arrays["k"][16] = np.nan
+        arrays["v"][16] = np.nan
+        return arrays
     queries = {"decode": 1, "chain": 5, "tree": 9, "prefill": 64,
                "masked_nan": 9, "tail_nan": 9, "short_history": 64,
                "empty_history": 5}[case]
@@ -209,6 +227,8 @@ def run(path, case="small"):
                   "stale_nan", "unregistered_state_rejected", "old_state_reader_rejected"]
         if case == "small":
             checks += ["indexed_write", "skip", "cross_page"]
+        elif case == "prefill1024":
+            checks += ["xqa_geometry", "broadcast_causal_mask", "1024_query_rows"]
         else:
             checks += ["xqa_geometry", "per_head_mask", "prefix_holes"]
         print(json.dumps({"passed": True, "case": case, "engine_aliases": aliases,
@@ -224,6 +244,6 @@ def run(path, case="small"):
 
 
 if __name__ == "__main__":
-    for case in ("small", "decode", "chain", "tree", "prefill", "masked_nan", "tail_nan",
+    for case in ("small", "decode", "chain", "tree", "prefill", "prefill1024", "masked_nan", "tail_nan",
                  "short_history", "empty_history"):
         run(sys.argv[1], case)

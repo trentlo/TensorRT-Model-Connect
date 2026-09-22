@@ -1,5 +1,9 @@
 # Standalone XQA attention port
 
+This records the single-profile kernel-port experiment. The subsequent
+[prefill/decode profile comparison](SPECULATIVE_PROFILES_PERFORMANCE.md)
+measures specialized profiles and larger prefill chunks with fresh controls.
+
 The original MC attention-state plugin was slow because its attention kernel
 used scalar dot products and serial value accumulation. On GB100, it accounted
 for **78.5% of aggregate GPU kernel time** in a six-request profile. Indexed KV

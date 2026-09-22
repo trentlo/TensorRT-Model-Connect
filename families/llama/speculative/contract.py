@@ -7,6 +7,25 @@ from dataclasses import asdict, dataclass
 
 
 @dataclass(frozen=True)
+class ExecutionProfile:
+    """Phase and MIN/OPT/MAX row counts; index is its position in the manifest."""
+
+    phase: str
+    query: tuple[int, int, int]
+    logits: tuple[int, int, int]
+
+    def __post_init__(self):
+        if self.phase not in {"prefill", "decode"}:
+            raise ValueError("unknown execution phase")
+        for bounds in (self.query, self.logits):
+            if (len(bounds) != 3 or any(type(x) is not int for x in bounds)
+                    or not 1 == bounds[0] <= bounds[1] <= bounds[2]):
+                raise ValueError("profile requires positive ordered MIN/OPT/MAX rows with MIN=1")
+        if any(logits > query for logits, query in zip(self.logits, self.query)):
+            raise ValueError("selected logits exceed query rows")
+
+
+@dataclass(frozen=True)
 class EngineContract:
     """Fixed-capacity linear state with explicit query visibility and positions.
 
@@ -30,6 +49,7 @@ class EngineContract:
     attention_backend: str = "primitives"
     page_size: int = 0
     alias_contract: str = "engine_required_alias"
+    execution_profiles: tuple[ExecutionProfile, ...] = ()
 
     def __post_init__(self):
         if self.version not in {1, 2} or self.role not in {"target", "draft"}:
@@ -55,6 +75,25 @@ class EngineContract:
                 raise ValueError(f"{name} must be a positive integer")
         if self.max_query > self.capacity:
             raise ValueError("max_query exceeds cache capacity")
+        if self.execution_profiles:
+            if tuple(p.phase for p in self.execution_profiles) != ("prefill", "decode"):
+                raise ValueError("expected profile 0=prefill and profile 1=decode")
+            if max(p.query[2] for p in self.execution_profiles) != self.max_query:
+                raise ValueError("max_query must cover exactly the declared profiles")
+            if self.execution_profiles[0].logits != (1, 1, 1):
+                raise ValueError("prefill selects one output row")
+            if self.role == "draft" and self.execution_profiles[1].logits != (1, 1, 1):
+                raise ValueError("draft selects one output row")
+
+    def profile_shapes(self, name, shape):
+        """Return each profile's MIN/OPT/MAX tensor shapes, independent of TRT."""
+        if not self.execution_profiles:
+            bounds = [(1, min(16, self.max_query), self.max_query)]
+        else:
+            bounds = [p.logits if name == "logits_indices" else p.query
+                      for p in self.execution_profiles]
+        return [tuple(tuple(rows if dim == -1 else dim for dim in shape) for rows in bound)
+                for bound in bounds]
 
     def to_dict(self):
         return asdict(self)

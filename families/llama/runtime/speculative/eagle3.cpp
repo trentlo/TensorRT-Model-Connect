@@ -26,7 +26,8 @@ std::vector<T> slice(const std::vector<T>& source, std::size_t start, std::size_
 
 Eagle3::Eagle3(Engine& draft, const std::vector<std::int32_t>& mapping, int depth, int width)
     : draft_(draft), mapping_(mapping), depth_(depth), width_(width) {
-    if (width < 1 || width > 2 || depth < 1 || depth * width + 1 > draft.contract().max_query)
+    if (width < 1 || width > 2 || depth < 1 ||
+        depth + 1 > draft.contract().query_limit(Phase::kDecode))
         throw std::invalid_argument("EAGLE3 proposal exceeds the compiled query profile");
 }
 
@@ -36,12 +37,13 @@ void Eagle3::prefill(const std::vector<std::int32_t>& prompt, int root,
     auto shifted = slice(prompt, 1, prompt.size());
     shifted.push_back(root);
     for (int start = 0; start < static_cast<int>(prompt.size());) {
-        const int rows = std::min(c.max_query, static_cast<int>(prompt.size()) - start);
-        result_ =
-            draft_.run(slice(shifted, start, start + rows), start, chain(rows), false,
-                       slice(target_features, static_cast<std::size_t>(start) * c.feature_width,
-                             static_cast<std::size_t>(start + rows) * c.feature_width),
-                       std::vector<std::uint16_t>(static_cast<std::size_t>(rows) * c.hidden, 0));
+        const int rows =
+            std::min(c.query_limit(Phase::kPrefill), static_cast<int>(prompt.size()) - start);
+        result_ = draft_.run(
+            Phase::kPrefill, slice(shifted, start, start + rows), start, chain(rows), false,
+            slice(target_features, static_cast<std::size_t>(start) * c.feature_width,
+                  static_cast<std::size_t>(start + rows) * c.feature_width),
+            std::vector<std::uint16_t>(static_cast<std::size_t>(rows) * c.hidden, 0));
         start += rows;
     }
 }
@@ -74,7 +76,7 @@ CandidateTree Eagle3::propose(int root, int committed, int remaining) {
         if (step + 1 < depth) {
             auto recurrent = slice(result_.features, result_.features.size() - c.hidden,
                                    result_.features.size());
-            result_ = draft_.run({candidate}, committed + step, {-1}, false,
+            result_ = draft_.run(Phase::kDecode, {candidate}, committed + step, {-1}, false,
                                  std::vector<std::uint16_t>(c.feature_width, 0), recurrent);
         }
     }
@@ -94,8 +96,8 @@ void Eagle3::feedback(const CandidateTree& tree, const std::vector<std::int32_t>
         const auto row = slice(target_features, offset, offset + c.feature_width);
         features.insert(features.end(), row.begin(), row.end());
     }
-    result_ = draft_.run(tokens, committed, chain(static_cast<int>(tokens.size())), false, features,
-                         std::vector<std::uint16_t>(tokens.size() * c.hidden, 0));
+    result_ = draft_.run(Phase::kDecode, tokens, committed, chain(static_cast<int>(tokens.size())),
+                         false, features, std::vector<std::uint16_t>(tokens.size() * c.hidden, 0));
 }
 
 } // namespace trtmc::llama::speculative
